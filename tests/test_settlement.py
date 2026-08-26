@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from nbtrend.core.types import Side
 from nbtrend.execution.base import SETTLEMENT_TOLERANCE, credited_currency
 from nbtrend.execution.nobitex import NobitexBroker
