@@ -57,15 +57,25 @@ class Basis:
         return self.basis > 0
 
 
-def fair_rial_price(global_usd: float, fx_rial_per_usdt: float) -> float:
-    """What the IRT market *should* print, given the global price and FX."""
-    return global_usd * fx_rial_per_usdt
+def fair_rial_price(
+    global_usd: float, fx_rial_per_usdt: float, multiplier: int = 1
+) -> float:
+    """What the IRT market *should* print, given the global price and FX.
+
+    `multiplier` covers Nobitex's scaled markets: 1K_SHIBIRT is quoted per
+    1,000 SHIB, so its fair price is 1,000x the per-unit global price.
+    """
+    return global_usd * fx_rial_per_usdt * multiplier
 
 
 def compute_basis(
-    symbol: str, local_rial: float, global_usd: float, fx_rial_per_usdt: float
+    symbol: str,
+    local_rial: float,
+    global_usd: float,
+    fx_rial_per_usdt: float,
+    multiplier: int = 1,
 ) -> Basis:
-    fair = fair_rial_price(global_usd, fx_rial_per_usdt)
+    fair = fair_rial_price(global_usd, fx_rial_per_usdt, multiplier)
     return Basis(
         symbol=symbol,
         local_rial=local_rial,

@@ -9,6 +9,9 @@ data:
   warmup_bars: 400            # bars of history needed before the first signal
   history_days: 900           # how far back `nbtrend fetch` pulls
   cache_dir: "data/candles"
+  # Bounded fan-out for a large universe. Too high trips Nobitex per-IP
+  # rate limits and opens too many TradingView sockets at once.
+  max_concurrent_fetches: 8
 
   global_feed: "tradingview"  # tradingview | binance  (see data/README notes)
   tradingview:
@@ -103,6 +106,13 @@ execution:
   # time for a position change too small to matter. Only trade when the gap
   # between current and target weight exceeds this fraction of equity.
   min_rebalance_weight: 0.05
+
+  # Nobitex credits a wallet ~2s AFTER the fill is acknowledged. Reading
+  # balances inside that window returns pre-trade numbers, which makes the
+  # next symbol in the rebalance loop over-estimate available cash. The
+  # runner confirms the credit landed instead of assuming a fixed delay.
+  settlement_poll_s: 0.5      # how often to re-read wallets while confirming
+  settlement_timeout_s: 20    # give up confirming after this long
 
   order_type: "limit"          # limit | market
   limit_offset_bps: 5          # how far through the touch to post a limit

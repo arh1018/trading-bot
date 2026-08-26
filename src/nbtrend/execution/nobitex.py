@@ -20,7 +20,7 @@ from collections import deque
 
 from ..core.types import BookTop, Order, OrderStatus, OrderType, Side
 from ..data.nobitex_rest import NobitexError, NobitexREST
-from .base import new_client_order_id
+from .base import SETTLEMENT_TOLERANCE, new_client_order_id
 
 log = logging.getLogger(__name__)
 
@@ -49,12 +49,21 @@ class _OrderRateGuard:
 
 
 class NobitexBroker:
-    def __init__(self, rest: NobitexREST, symbol_specs: dict[str, object], dry_run: bool = False):
+    def __init__(
+        self,
+        rest: NobitexREST,
+        symbol_specs: dict[str, object],
+        dry_run: bool = False,
+        settlement_poll_s: float = 0.5,
+        settlement_timeout_s: float = 20.0,
+    ):
         if not rest._token:
             raise RuntimeError("NobitexBroker needs an API token; set NOBITEX_API_TOKEN")
         self.rest = rest
         self.specs = symbol_specs
         self.dry_run = dry_run
+        self.settlement_poll_s = settlement_poll_s
+        self.settlement_timeout_s = settlement_timeout_s
         self._guard = _OrderRateGuard()
         self._by_coid: dict[str, Order] = {}
 
@@ -138,6 +147,46 @@ class NobitexBroker:
         except NobitexError as exc:
             log.warning("cancel failed for %s: %s", order.client_order_id, exc)
             return False
+
+    def await_settlement(self, currency: str, baseline: float, expected_delta: float) -> bool:
+        """Block until the credited wallet reflects a fill, or time out.
+
+        Nobitex acknowledges a fill before the wallet is updated -- roughly a
+        2 second lag. Anything reading balances inside that window sees
+        pre-trade numbers, and in a sequential rebalance loop that makes the
+        next symbol over-estimate available cash and overdraw the rial wallet.
+
+        This confirms the credit actually landed rather than sleeping a fixed
+        interval, because the lag is not guaranteed to stay 2s under load. On
+        timeout it returns False and logs; the caller decides whether to
+        proceed, with the runner's cash clamp as the backstop.
+        """
+        if expected_delta <= 0:
+            return True
+
+        target = baseline + expected_delta * SETTLEMENT_TOLERANCE
+        deadline = time.time() + self.settlement_timeout_s
+
+        while time.time() < deadline:
+            time.sleep(self.settlement_poll_s)
+            try:
+                observed = self.rest.wallets([currency]).get(currency, baseline)
+            except Exception:
+                log.warning("balance read failed while confirming settlement", exc_info=True)
+                continue
+
+            if observed >= target:
+                log.debug(
+                    "%s settled: %.8f -> %.8f (expected +%.8f)",
+                    currency, baseline, observed, expected_delta,
+                )
+                return True
+
+        log.warning(
+            "%s did not reflect a credit of %.8f within %.0fs; balances may be stale",
+            currency, expected_delta, self.settlement_timeout_s,
+        )
+        return False
 
     def _reconcile(self, coid: str) -> Order | None:
         """Did the order land despite the error?"""

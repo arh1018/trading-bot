@@ -38,6 +38,24 @@ class Broker(Protocol):
     def open_orders(self, symbol: str | None = None) -> list[Order]: ...
 
 
+SETTLEMENT_TOLERANCE = 0.98
+"""Fraction of the expected credit that counts as settled.
+
+Fees are deducted from the credited side, so the observed delta is always a
+little smaller than the notional. Requiring the full amount would never
+confirm.
+"""
+
+
+def credited_currency(side: Side, base: str, quote: str) -> str:
+    """Which wallet receives value from a fill.
+
+    Nobitex blocks the debited side at submission but credits the other side
+    only after settlement, so this is the wallet worth watching.
+    """
+    return base if side is Side.BUY else quote
+
+
 def new_client_order_id(prefix: str = "nbt") -> str:
     """Nobitex allows 32 chars and requires uniqueness among live orders."""
     return f"{prefix}{uuid.uuid4().hex[:16]}{int(time.time()) % 100000}"[:32]

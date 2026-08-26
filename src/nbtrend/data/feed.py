@@ -54,6 +54,25 @@ class DataFeed:
         self.store = CandleStore(cfg.data["cache_dir"])
         self.resolution: str = str(cfg.data["timeframe"])
         self._source: str = cfg.data.get("global_feed", "tradingview")
+        # USDTIRT is the same series for every symbol. Fetching it per symbol
+        # is 120 identical REST calls per cycle -- slow, and a pointless share
+        # of the rate limit.
+        self._fx_cache: pd.DataFrame | None = None
+        self._fx_lock = asyncio.Lock()
+        self._fetch_semaphore = asyncio.Semaphore(
+            int(cfg.data.get("max_concurrent_fetches", 8))
+        )
+
+    async def fx_history(self, days: int) -> pd.DataFrame:
+        """USDTIRT candles, fetched once per DataFeed lifetime."""
+        async with self._fx_lock:
+            if self._fx_cache is None:
+                self._fx_cache = await asyncio.to_thread(self.fetch_local, self.cfg.fx, days)
+            return self._fx_cache
+
+    def invalidate_fx(self) -> None:
+        """Drop the cached FX series so the next cycle refetches it."""
+        self._fx_cache = None
 
     # -- global (USD) ------------------------------------------------------
     async def fetch_global(self, spec: SymbolSpec, bars: int) -> pd.DataFrame:
@@ -101,20 +120,46 @@ class DataFeed:
         # the event loop for seconds, which starves the Centrifugo pong
         # handler and gets the websocket dropped for "no pong".
         local_df = await asyncio.to_thread(self.fetch_local, spec, days)
-        fx_df = await asyncio.to_thread(self.fetch_local, self.cfg.fx, days)
+        fx_df = await self.fx_history(days)
 
-        frame = _merge_on_global_clock(global_df, local_df, fx_df)
+        frame = _merge_on_global_clock(global_df, local_df, fx_df, spec.multiplier)
         return SymbolDataset(spec=spec, frame=frame)
 
     async def build_all(self, specs: list[SymbolSpec] | None = None) -> dict[str, SymbolDataset]:
+        """Build every symbol's dataset concurrently.
+
+        Sequential fetching does not scale: at ~10s per symbol a 120-market
+        universe takes 20 minutes per decision cycle, longer than some of the
+        bars it is deciding on. Concurrency is bounded by a semaphore so we
+        neither trip Nobitex's per-IP rate limit nor open 120 simultaneous
+        TradingView sockets.
+        """
         specs = specs or self.cfg.enabled_symbols
-        out: dict[str, SymbolDataset] = {}
-        for spec in specs:
-            try:
-                out[spec.nobitex] = await self.build_dataset(spec)
-                log.info("%s: %d aligned bars", spec.nobitex, len(out[spec.nobitex]))
-            except Exception:
-                log.exception("failed to build dataset for %s", spec.nobitex)
+
+        # Warm the shared FX series before fanning out, or the first N workers
+        # all race for the same lock.
+        await self.fx_history(int(self.cfg.data.get("history_days", 900)))
+
+        async def one(spec: SymbolSpec) -> tuple[str, SymbolDataset | None]:
+            async with self._fetch_semaphore:
+                try:
+                    return spec.nobitex, await self.build_dataset(spec)
+                except Exception as exc:
+                    log.warning("failed to build dataset for %s: %s", spec.nobitex, exc)
+                    return spec.nobitex, None
+
+        results = await asyncio.gather(*(one(spec) for spec in specs))
+
+        out = {name: ds for name, ds in results if ds is not None and not ds.frame.empty}
+        failed = [name for name, ds in results if ds is None]
+        if failed:
+            log.info(
+                "built %d/%d datasets (%d failed: %s%s)",
+                len(out), len(specs), len(failed), ", ".join(failed[:5]),
+                "..." if len(failed) > 5 else "",
+            )
+        else:
+            log.info("built %d/%d datasets", len(out), len(specs))
         return out
 
 
@@ -128,7 +173,10 @@ def _bars_per_day(resolution: str) -> int:
 
 
 def _merge_on_global_clock(
-    global_df: pd.DataFrame, local_df: pd.DataFrame, fx_df: pd.DataFrame
+    global_df: pd.DataFrame,
+    local_df: pd.DataFrame,
+    fx_df: pd.DataFrame,
+    multiplier: int = 1,
 ) -> pd.DataFrame:
     """Align local rial and FX onto the global bar clock, backward-only."""
     if global_df.empty:
@@ -150,7 +198,9 @@ def _merge_on_global_clock(
         )
         out[name] = merged[name].to_numpy()
 
-    out["fair_rial"] = out["close"] * out["fx"]
+    # `multiplier` handles Nobitex's scaled markets (1K_SHIB, 1M_PEPE, ...),
+    # which quote a bundle of units against a per-unit global feed.
+    out["fair_rial"] = out["close"] * out["fx"] * multiplier
     out["basis"] = (out["local_close"] / out["fair_rial"]) - 1.0
     return out
 

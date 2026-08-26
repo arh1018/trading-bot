@@ -38,8 +38,17 @@ class BinanceFeed:
         self.timeout_s = timeout_s
 
     def _to_binance_symbol(self, symbol: str) -> str:
-        """Accept either `BINANCE:BTCUSDT` or a bare `BTCUSDT`."""
-        return symbol.split(":", 1)[-1].upper()
+        """Normalise a TradingView symbol to a Binance pair.
+
+        Accepts `BINANCE:BTCUSDT`, a bare `BTCUSDT`, or the aggregate-index
+        form `CRYPTO:HYPEUSD` that `build_universe.py` emits for tokens Binance
+        does not list. Binance quotes in USDT, never USD, so a trailing USD is
+        promoted -- otherwise the fallback requests `HYPEUSD` and gets a 400.
+        """
+        pair = symbol.split(":", 1)[-1].upper()
+        if pair.endswith("USD") and not pair.endswith("BUSD"):
+            pair = pair + "T"
+        return pair
 
     async def fetch_ohlcv(
         self, symbol: str, resolution: str, bars: int = 5000

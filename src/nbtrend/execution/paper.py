@@ -96,6 +96,12 @@ class PaperBroker:
     def status(self, order: Order) -> Order:
         return self._orders.get(order.client_order_id or "", order)
 
+    def await_settlement(self, currency: str, baseline: float, expected_delta: float) -> bool:
+        """No-op: `_settle` mutates the local ledger inline, so a paper fill is
+        already visible by the time `submit` returns. Present so the paper and
+        live paths stay behaviourally identical."""
+        return True
+
     def cancel(self, order: Order) -> bool:
         stored = self._orders.get(order.client_order_id or "")
         if stored and stored.status in (OrderStatus.ACTIVE, OrderStatus.PARTIAL):

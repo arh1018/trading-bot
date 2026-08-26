@@ -33,6 +33,15 @@ class SymbolSpec:
     amount_step: float = 1e-8
     price_step: float = 1.0
     enabled: bool = True
+    multiplier: int = 1
+    """Base-asset units per quoted unit.
+
+    Nobitex quotes `1K_SHIBIRT` per 1,000 SHIB and `1M_PEPEIRT` per 1,000,000
+    PEPE, while the global feed is always per 1 unit. The fair rial price is
+    therefore `global_usd * fx * multiplier`. Leaving this at 1 on a scaled
+    market makes the basis check see a 1000x dislocation and refuse to trade
+    it, every cycle, silently.
+    """
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SymbolSpec:
@@ -44,6 +53,7 @@ class SymbolSpec:
             amount_step=float(d.get("amount_step", 1e-8)),
             price_step=float(d.get("price_step", 1.0)),
             enabled=bool(d.get("enabled", True)),
+            multiplier=int(d.get("multiplier", 1)),
         )
 
 

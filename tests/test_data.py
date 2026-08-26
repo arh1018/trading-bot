@@ -121,3 +121,48 @@ def test_empty_store_returns_a_typed_frame(tmp_path):
     assert out.empty
     assert list(out.columns) == ["open", "high", "low", "close", "volume"]
     assert out.index.dtype == empty_ohlcv().index.dtype
+
+
+def test_scaled_market_fair_price_uses_the_multiplier():
+    """1K_SHIBIRT is quoted per 1,000 SHIB against a per-unit global feed.
+    Without the multiplier the basis reads as a 1000x dislocation and the
+    interlock refuses to trade it, silently, every cycle."""
+    b = compute_basis(
+        "1K_SHIBIRT",
+        local_rial=20_000.0,      # per 1,000 SHIB
+        global_usd=0.00001,       # per 1 SHIB
+        fx_rial_per_usdt=2_000_000.0,
+        multiplier=1_000,
+    )
+    assert b.fair_rial == pytest.approx(20_000.0)
+    assert abs(b.basis) < 1e-9
+
+    unscaled = compute_basis("1K_SHIBIRT", 20_000.0, 0.00001, 2_000_000.0)
+    assert unscaled.basis > 900, "without the multiplier this looks 1000x dislocated"
+
+
+def test_fair_rial_price_multiplier_is_linear():
+    assert fair_rial_price(2.0, 1_000_000.0, 1) == 2_000_000.0
+    assert fair_rial_price(2.0, 1_000_000.0, 1_000) == 2_000_000_000.0
+
+
+def test_merge_applies_the_multiplier_to_fair_price():
+    idx = pd.date_range("2024-01-01", periods=2, freq="4h", tz="UTC")
+    global_df = _frame(idx, [0.00001, 0.00001])
+    local_df = _frame(idx, [20_000.0, 20_000.0])
+    fx_df = _frame(idx, [2_000_000.0, 2_000_000.0])
+
+    out = _merge_on_global_clock(global_df, local_df, fx_df, multiplier=1_000)
+    assert out["fair_rial"].iloc[0] == pytest.approx(20_000.0)
+    assert out["basis"].abs().max() < 1e-9
+
+
+def test_symbol_spec_parses_multiplier():
+    from nbtrend.config import SymbolSpec
+
+    scaled = SymbolSpec.from_dict(
+        {"nobitex": "1M_PEPEIRT", "src": "1m_pepe", "dst": "rls", "multiplier": 1_000_000}
+    )
+    assert scaled.multiplier == 1_000_000
+    plain = SymbolSpec.from_dict({"nobitex": "BTCIRT", "src": "btc", "dst": "rls"})
+    assert plain.multiplier == 1

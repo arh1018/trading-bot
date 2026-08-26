@@ -42,7 +42,7 @@ from ..data.nobitex_ws import (
     market_stats_channel,
     orderbook_channel,
 )
-from ..execution.base import Broker
+from ..execution.base import Broker, credited_currency
 from ..execution.nobitex import NobitexBroker
 from ..execution.paper import PaperBroker
 from ..execution.router import OrderRouter
@@ -117,7 +117,12 @@ class LiveRunner:
             self.cfg.creds.require_token()
             specs = {s.nobitex: s for s in [*self.cfg.enabled_symbols, self.cfg.fx]}
             log.warning("LIVE MODE -- orders will be sent to Nobitex")
-            return NobitexBroker(self.rest, specs)
+            return NobitexBroker(
+                self.rest,
+                specs,
+                settlement_poll_s=float(self.cfg.execution.get("settlement_poll_s", 0.5)),
+                settlement_timeout_s=float(self.cfg.execution.get("settlement_timeout_s", 20.0)),
+            )
 
         starting = {"rls": float(self.cfg.backtest["initial_equity_rial"])}
         log.info("paper mode -- starting with %s rial", f"{starting['rls']:,.0f}")
@@ -348,7 +353,20 @@ class LiveRunner:
             spec.nobitex, state.score, current_weight, state.target_weight,
             side.value, delta_amount,
         )
+        credited = credited_currency(side, base, "rls")
+        baseline = self.broker.balances().get(credited, 0.0)
+
         report = self.router.execute(spec, side, delta_amount)
+
+        if report.filled:
+            # Nobitex credits the wallet ~2s after acknowledging the fill.
+            # Confirm it landed before the loop moves to the next symbol,
+            # whose sizing reads this same rial balance.
+            expected = (
+                report.filled if side is Side.BUY else report.filled * report.avg_price
+            )
+            self.broker.await_settlement(credited, baseline, expected)
+
         if report.filled:
             log.info(
                 "%s: filled %.8f @ %s rial (%d attempt(s)%s)",
