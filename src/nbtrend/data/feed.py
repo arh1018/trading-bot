@@ -62,6 +62,15 @@ class DataFeed:
         self._fetch_semaphore = asyncio.Semaphore(
             int(cfg.data.get("max_concurrent_fetches", 8))
         )
+        # TradingView circuit breaker. Its datafeed rate-limits concurrent
+        # anonymous sockets (HTTP 429), so on a large universe every symbol
+        # fails over to Binance anyway -- after paying ~2s for the rejected
+        # connection. Retrying it 112 times a cycle is slow for us and abusive
+        # to a free service, so a run of failures trips the breaker and the
+        # rest of the session goes straight to Binance.
+        self._tv_failures = 0
+        self._tv_disabled = False
+        self._tv_failure_limit = int(cfg.data.get("tradingview_failure_limit", 3))
 
     async def fx_history(self, days: int) -> pd.DataFrame:
         """USDTIRT candles, fetched once per DataFeed lifetime."""
@@ -79,7 +88,7 @@ class DataFeed:
         if not spec.tradingview:
             raise ValueError(f"{spec.nobitex} has no `tradingview` symbol in universe.yaml")
 
-        if self._source == "binance":
+        if self._source == "binance" or self._tv_disabled:
             df = await BinanceFeed().fetch_ohlcv(spec.tradingview, self.resolution, bars)
         else:
             tv = self.cfg.data["tradingview"]
@@ -91,11 +100,18 @@ class DataFeed:
             )
             try:
                 df = await feed.fetch_ohlcv(spec.tradingview, self.resolution, bars)
+                self._tv_failures = 0
             except Exception as exc:
-                log.warning(
-                    "TradingView failed for %s (%s); falling back to Binance",
-                    spec.tradingview, exc,
-                )
+                self._tv_failures += 1
+                if self._tv_failures >= self._tv_failure_limit and not self._tv_disabled:
+                    self._tv_disabled = True
+                    log.warning(
+                        "TradingView failed %d times in a row (%s); using Binance for the "
+                        "rest of this session. Set data.global_feed: binance to skip this.",
+                        self._tv_failures, exc,
+                    )
+                else:
+                    log.debug("TradingView failed for %s (%s); using Binance", spec.tradingview, exc)
                 df = await BinanceFeed().fetch_ohlcv(spec.tradingview, self.resolution, bars)
 
         return self.store.append(df, self._source, spec.tradingview, self.resolution)

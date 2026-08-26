@@ -13,7 +13,16 @@ data:
   # rate limits and opens too many TradingView sockets at once.
   max_concurrent_fetches: 8
 
-  global_feed: "tradingview"  # tradingview | binance  (see data/README notes)
+  # tradingview | binance.
+  #
+  # TradingView aggregates many venues and needs no key, but its anonymous
+  # datafeed rate-limits concurrent sockets (HTTP 429). That is fine for a
+  # handful of symbols and unusable for a 100+ universe, where every symbol
+  # fails over to Binance anyway after paying for a rejected connection.
+  # Binance is documented, versioned, keyless and weight-limited -- the right
+  # default at this size. Switch back to tradingview for a small universe.
+  global_feed: "binance"
+  tradingview_failure_limit: 3   # consecutive failures before the breaker trips
   tradingview:
     # Unofficial, unauthenticated TradingView datafeed. No key required.
     # It is scraped, not contractual -- `binance` is the drop-in fallback.

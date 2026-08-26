@@ -60,10 +60,26 @@ make shadow MINUTES=15          # shadow test the full live stack, no real money
 No credentials are needed for anything except live trading — all market data
 used here is public.
 
-### Adding your tokens
+### The trading universe
 
-Edit [config/universe.yaml](config/universe.yaml). Each entry maps a Nobitex
-market to its global reference feed:
+[config/universe.yaml](config/universe.yaml) is **generated**, not hand-written:
+
+```bash
+python scripts/build_universe.py --top 120
+```
+
+It ranks Nobitex's ~231 live IRT books by 24h rial volume (a trend signal you
+cannot fill is worthless, and the tail of the IRT book is very thin) and
+resolves three things a hand-written list gets wrong:
+
+| problem | what the builder does |
+| --- | --- |
+| **Scaled markets** | `1K_SHIBIRT` is quoted per 1,000 SHIB, `1M_PEPEIRT` per 1,000,000, `1B_BABYDOGEIRT` per 1e9 — against a per-unit global feed. Emits `multiplier:`, so `fair = global × fx × multiplier`. Without it the basis check sees a 1000× dislocation and silently refuses those markets every cycle. |
+| **Missing feeds** | Checks each pair against Binance `exchangeInfo`; falls back to TradingView's `CRYPTO:*USD` index, and emits `enabled: false` where neither resolves rather than failing every cycle. |
+| **Tokenized equities** | Nobitex lists `AAPLIRT`, `AMZNIRT` and friends. Emitted disabled — they are not 24/7 instruments, and a 24/7 trend model will hold them straight through a weekend gap. |
+
+Re-run it after any Nobitex listing change. To hand-edit, each entry looks
+like:
 
 ```yaml
 - nobitex: SOLIRT             # Nobitex market symbol, UPPERCASE
@@ -77,6 +93,17 @@ market to its global reference feed:
 
 Pick the *most liquid* global venue for `tradingview`, not the local one — the
 whole point is to read the price that leads.
+
+**Scaling note.** A 112-symbol universe is only usable because fetches fan out
+under a bounded semaphore and USDT/IRT is fetched once per cycle rather than
+once per symbol. Sequential fetching took an estimated ~20 minutes per decision
+cycle; it now takes **63 seconds**. Tune with `data.max_concurrent_fetches` —
+too high and Nobitex's per-IP rate limit bites.
+
+Note also that `risk.max_weight_per_symbol` stops being the binding constraint
+at this size: with 112 symbols signalling, the gross-exposure cap does the real
+work and each position lands near 0.9% of equity. Check that against
+`costs.min_order_rial` (3,000,000) before shrinking your account.
 
 ### Going live
 
@@ -252,8 +279,9 @@ src/nbtrend/
     walkforward.py       parameter search with out-of-sample validation
   live/runner.py         the trading loop
   cli.py                 nbtrend <command>
+scripts/build_universe.py generates universe.yaml from the live market list
 scripts/shadow_test.py   full-stack dry run against real markets
-tests/                   74 tests
+tests/                   87 tests
 ```
 
 ### Data sources
@@ -273,7 +301,7 @@ TradingView is cheap insurance.
 ## Testing
 
 ```bash
-make test    # 74 tests
+make test    # 87 tests
 make lint
 ```
 

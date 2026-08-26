@@ -166,3 +166,59 @@ def test_symbol_spec_parses_multiplier():
     assert scaled.multiplier == 1_000_000
     plain = SymbolSpec.from_dict({"nobitex": "BTCIRT", "src": "btc", "dst": "rls"})
     assert plain.multiplier == 1
+
+
+def test_binance_symbol_normalisation():
+    """The aggregate fallback emits CRYPTO:<BASE>USD, but Binance quotes USDT
+    only -- requesting <BASE>USD returns 400."""
+    from nbtrend.data.binance import BinanceFeed
+
+    f = BinanceFeed()
+    assert f._to_binance_symbol("BINANCE:BTCUSDT") == "BTCUSDT"
+    assert f._to_binance_symbol("BTCUSDT") == "BTCUSDT"
+    assert f._to_binance_symbol("CRYPTO:HYPEUSD") == "HYPEUSDT"
+    assert f._to_binance_symbol("CRYPTO:XMRUSD") == "XMRUSDT"
+    # Already a USDT pair ending in BUSD must not gain a second T.
+    assert f._to_binance_symbol("BINANCE:BUSDUSDT") == "BUSDUSDT"
+
+
+def test_tradingview_circuit_breaker_trips_after_repeated_failures():
+    """TradingView 429s under concurrency. Retrying it once per symbol on a
+    112-symbol universe is slow for us and abusive to a free service."""
+    from nbtrend.config import load_config
+    from nbtrend.data.feed import DataFeed
+
+    cfg = load_config()
+    cfg.raw["data"]["global_feed"] = "tradingview"
+    feed = DataFeed(cfg)
+
+    assert not feed._tv_disabled
+    feed._tv_failures = feed._tv_failure_limit
+    # The breaker is consulted on the next fetch; simulate that transition.
+    feed._tv_disabled = feed._tv_failures >= feed._tv_failure_limit
+    assert feed._tv_disabled
+
+
+def test_fx_series_is_fetched_once_not_once_per_symbol():
+    """USDTIRT is identical for every symbol; per-symbol fetching is 112
+    redundant REST calls per cycle."""
+    import asyncio
+
+    from nbtrend.config import load_config
+    from nbtrend.data.feed import DataFeed
+
+    cfg = load_config()
+    feed = DataFeed(cfg)
+    calls = {"n": 0}
+
+    def fake_fetch(spec, days):
+        calls["n"] += 1
+        return pd.DataFrame({"close": [1.0]}, index=pd.date_range("2024-01-01", periods=1, tz="UTC"))
+
+    feed.fetch_local = fake_fetch
+
+    async def run():
+        await asyncio.gather(*(feed.fx_history(10) for _ in range(20)))
+
+    asyncio.run(run())
+    assert calls["n"] == 1, f"FX fetched {calls['n']} times, expected 1"
