@@ -250,10 +250,15 @@ def run(
     else:
         console.print("[bold green]PAPER MODE[/bold green] -- no orders leave this process.")
 
+    from .live.lock import AlreadyRunning
     from .live.runner import LiveRunner
+
     runner = LiveRunner(cfg)
     try:
         asyncio.run(runner.run(once=once, minutes=minutes, interval_s=interval))
+    except AlreadyRunning as exc:
+        console.print(f"[bold red]refusing to start[/bold red]: {exc}")
+        raise typer.Exit(code=1) from exc
     except KeyboardInterrupt:
         console.print("\nstopped")
 

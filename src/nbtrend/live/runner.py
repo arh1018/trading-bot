@@ -47,6 +47,7 @@ from ..execution.nobitex import NobitexBroker
 from ..execution.paper import PaperBroker
 from ..execution.router import OrderRouter
 from ..units import round_to_step
+from .lock import SingleInstanceLock
 
 log = logging.getLogger(__name__)
 
@@ -136,6 +137,12 @@ class LiveRunner:
         self.state = RunnerState.load(self.state_path, self._safe_equity())
         self.ws = NobitexWS(cfg.ws_url)
         self._stop = asyncio.Event()
+        # One runner per account. Two live runners do not merely duplicate
+        # work: their target books differ, so each treats the other's fills as
+        # drift and reverses them, paying spread and fees both ways.
+        self._lock = SingleInstanceLock(
+            Path(f"data/state/{cfg.mode}.lock"), label=cfg.mode
+        )
 
     def _safe_equity(self) -> float | None:
         """Best-effort rial equity for the stale-peak check.
@@ -223,6 +230,9 @@ class LiveRunner:
 
         deadline = time.time() + minutes * 60 if minutes else None
 
+        # Refuse to start rather than trade against another instance.
+        self._lock.acquire()
+
         try:
             await self._await_books(timeout_s=45)
             while not self._stop.is_set():
@@ -255,6 +265,7 @@ class LiveRunner:
                 await ws_task
             self.state.save(self.state_path)
             self.rest.close()
+            self._lock.release()
 
     async def _await_books(self, timeout_s: float) -> None:
         deadline = time.time() + timeout_s
