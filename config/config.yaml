@@ -136,6 +136,13 @@ execution:
   # between current and target weight exceeds this fraction of equity.
   min_rebalance_weight: 0.05
 
+  # Incumbency hysteresis. With ~3 fundable slots on a small account, the last
+  # slot flips on tiny score differences and each flip pays a full round trip
+  # (0.22% fees plus the spread, measured at a 62bp median outside the majors).
+  # A name already in the book keeps its slot unless a challenger's score beats
+  # it by this margin. Scores are roughly -1..+1, so 0.10 is a real gap.
+  incumbent_score_bonus: 0.10
+
   # Nobitex credits a wallet ~2s AFTER the fill is acknowledged. Reading
   # balances inside that window returns pre-trade numbers, which makes the
   # next symbol in the rebalance loop over-estimate available cash. The

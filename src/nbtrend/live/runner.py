@@ -52,6 +52,8 @@ from .lock import SingleInstanceLock
 log = logging.getLogger(__name__)
 
 MAX_STALENESS_S = 120.0
+HALT_RESUME_FRACTION = 0.5
+"""Resume trading once drawdown recovers to half the stop (hysteresis)."""
 
 
 @dataclass
@@ -85,7 +87,12 @@ class RunnerState:
         path.write_text(json.dumps(asdict(self), indent=2))
 
     @classmethod
-    def load(cls, path: Path, current_equity: float | None = None) -> RunnerState:
+    def load(
+        cls,
+        path: Path,
+        current_equity: float | None = None,
+        max_drawdown_stop: float | None = None,
+    ) -> RunnerState:
         """Restore persisted state, discarding a peak that cannot belong here.
 
         `equity_peak_rial` is only meaningful for the account and mode that
@@ -111,10 +118,41 @@ class RunnerState:
             )
             state.equity_peak_rial = current_equity
             state.halted = False
+
+        # A halt is a circuit breaker, not a latch. Trusting the stored flag
+        # means one breach silently disarms the bot forever: every symbol gets
+        # target_weight 0.0, so it sells the book every cycle and never buys
+        # again, with nothing in the log to say why. Re-derive it from what the
+        # account actually looks like now.
+        if state.halted:
+            drawdown = (
+                current_equity / state.equity_peak_rial - 1.0
+                if current_equity and state.equity_peak_rial
+                else 0.0
+            )
+            still_breached = (
+                max_drawdown_stop is not None and drawdown <= -abs(max_drawdown_stop)
+            )
+            if still_breached:
+                log.error(
+                    "resuming halted: drawdown %.1f%% is still past the limit; "
+                    "the book stays flat until equity recovers",
+                    drawdown * 100,
+                )
+            else:
+                log.warning(
+                    "clearing a persisted halt: drawdown %.1f%% is within the limit",
+                    drawdown * 100,
+                )
+                state.halted = False
         return state
 
 
 class LiveRunner:
+    # Class-level default so selection works on a partially built runner
+    # (the risk tests exercise _limit_positions without a full __init__).
+    _book: set[str] = set()
+
     def __init__(self, cfg: Config, broker: Broker | None = None):
         self.cfg = cfg
         self.rest = NobitexREST(cfg.rest_url, cfg.creds.api_token,
@@ -122,6 +160,8 @@ class LiveRunner:
         self.feed = DataFeed(cfg)
         self.backtester = Backtester(cfg)
 
+        # Symbols selected last cycle, for incumbency hysteresis.
+        self._book: set[str] = set()
         self.states: dict[str, SymbolState] = {
             spec.nobitex: SymbolState(spec=spec) for spec in cfg.enabled_symbols
         }
@@ -134,7 +174,11 @@ class LiveRunner:
 
         # Namespaced by mode: a paper peak must never gate a live account.
         self.state_path = Path(f"data/state/runner-{cfg.mode}.json")
-        self.state = RunnerState.load(self.state_path, self._safe_equity())
+        self.state = RunnerState.load(
+            self.state_path,
+            self._safe_equity(),
+            float(cfg.risk["max_drawdown_stop"]),
+        )
         self.ws = NobitexWS(cfg.ws_url)
         self._stop = asyncio.Event()
         # One runner per account. Two live runners do not merely duplicate
@@ -149,12 +193,37 @@ class LiveRunner:
 
         Runs before the main loop, so it must never raise: a failure here
         should skip the check, not stop the bot starting.
+
+        This must value the POSITIONS, not just the cash. A fully invested
+        account holds almost no rial by design, so a cash-only reading made
+        every restart look like a catastrophic loss: observed live, a 9,839,505
+        peak was discarded against an apparent equity of 29,125. The peak
+        recovers on the next cycle, but until it does the 25% drawdown stop is
+        measured from a garbage high-water mark -- and over a multi-day run with
+        restarts that quietly disarms the main safety net.
+
+        The websocket books are not warm this early, so marks come from REST,
+        and only for currencies actually held (a handful of calls).
         """
         try:
-            return self.broker.balances().get("rls", 0.0) or None
+            balances = self.broker.balances()
         except Exception:
             log.debug("could not read balances while loading state", exc_info=True)
             return None
+
+        total = balances.get("rls", 0.0)
+        for symbol in self.states:
+            base, quote = _split_symbol(symbol)
+            amount = balances.get(base, 0.0)
+            if not amount or quote != "rls":
+                continue
+            try:
+                total += amount * self.rest.orderbook(symbol).mid
+            except Exception:
+                # An unmarkable holding is better skipped than guessed at; the
+                # worst case is the same cash-only reading we had before.
+                log.debug("could not mark %s while loading state", symbol, exc_info=True)
+        return total or None
 
     def _build_broker(self) -> Broker:
         if self.cfg.is_live:
@@ -298,12 +367,25 @@ class LiveRunner:
             return
 
         equity = await asyncio.to_thread(self.equity_rial)
+        if not self._book:
+            # Seed incumbency from what the account actually holds. Without
+            # this, the first cycle after any restart has no memory of the book
+            # and can churn out positions it opened moments earlier.
+            self._book = await asyncio.to_thread(self._held_symbols)
+            log.info("seeded incumbency from holdings: %s", ", ".join(sorted(self._book)) or "nothing")
         self.state.equity_peak_rial = max(self.state.equity_peak_rial, equity)
         drawdown = equity / self.state.equity_peak_rial - 1.0 if self.state.equity_peak_rial else 0.0
 
-        if drawdown <= -float(self.cfg.risk["max_drawdown_stop"]) and not self.state.halted:
+        stop = float(self.cfg.risk["max_drawdown_stop"])
+        if drawdown <= -stop and not self.state.halted:
             log.error("drawdown %.1f%% breached the limit -- flattening", drawdown * 100)
             self.state.halted = True
+        elif self.state.halted and drawdown > -stop * HALT_RESUME_FRACTION:
+            # Hysteresis, so a halt is not a one-way latch: resume only once
+            # equity has recovered well clear of the stop, not the instant it
+            # ticks back over the line.
+            log.warning("drawdown recovered to %.1f%% -- resuming", drawdown * 100)
+            self.state.halted = False
 
         datasets = await self.feed.build_all(self.cfg.enabled_symbols)
         max_basis = float(self.cfg.execution["max_basis_deviation"])
@@ -395,8 +477,25 @@ class LiveRunner:
         if not wanted or equity <= 0 or min_order <= 0:
             return states
 
-        # Highest conviction first -- score, not alphabetical order.
-        wanted.sort(key=lambda s: -abs(s.score))
+        # Highest conviction first, with a bonus for names already in the book.
+        #
+        # Pure score ranking makes the last fundable slot flip on noise. A live
+        # cycle bought CVX, then the next cycle wanted to evict it for ETH on a
+        # score difference of a few hundredths -- paying a full round trip
+        # (0.22% fees plus ~0.6% spread) to swap one trending name for another
+        # barely-better one. On a small account only ~3 slots are fundable, so
+        # that boundary is crossed constantly. An incumbent keeps its slot
+        # unless a challenger beats it by a real margin.
+        bonus = float(self.cfg.execution.get("incumbent_score_bonus", 0.0))
+        wanted.sort(key=lambda s: -(abs(s.score) + (bonus if s.spec.nobitex in self._book else 0.0)))
+        log.info(
+            "ranking (score, * = incumbent): %s",
+            ", ".join(
+                f"{s.spec.nobitex} {abs(s.score):+.2f}"
+                + ("*" if s.spec.nobitex in self._book else "")
+                for s in wanted[:8]
+            ),
+        )
         ceiling = int((equity * max_gross) // min_order) or 1
         limit = min(configured or ceiling, ceiling, len(wanted))
         original = {id(s): s.target_weight for s in wanted}
@@ -418,7 +517,19 @@ class LiveRunner:
                 state.target_weight = original[id(state)]
             self._cap_gross(trial)
 
-            if all(abs(s.target_weight) * equity >= min_order for s in trial):
+            # The 3,000,000 minimum is a limit on ORDERS, not on holdings.
+            # Keeping a position already in the book places no order at all, so
+            # an incumbent whose vol-targeted size lands just under the minimum
+            # is still perfectly holdable. Testing it as if it had to be opened
+            # from flat produced a stalemate live: CVX sized to 2,970,000 was
+            # dropped from selection, the slot went to a name there was no cash
+            # to buy, and the CVX sell was then itself skipped for being under
+            # the minimum -- so every cycle churned intent and traded nothing.
+            if all(
+                abs(s.target_weight) * equity >= min_order
+                or s.spec.nobitex in self._book
+                for s in trial
+            ):
                 selected = trial
             else:
                 candidate.target_weight = 0.0
@@ -432,6 +543,7 @@ class LiveRunner:
             if id(state) not in chosen:
                 state.target_weight = 0.0
 
+        self._book = {s.spec.nobitex for s in selected}
         held = [s.spec.nobitex for s in selected]
         dropped = [s.spec.nobitex for s in wanted if id(s) not in chosen]
         log.info(
@@ -466,7 +578,17 @@ class LiveRunner:
             if not live:
                 return
 
-            underfunded = [s for s in live if abs(s.target_weight) * equity < min_order]
+            # Same open-vs-hold distinction as in `_limit_positions`: a name we
+            # already own needs no order to stay in the book, so a sub-minimum
+            # target is not a reason to drop it. Dropping it instead sets a sell
+            # that is itself under the minimum and gets skipped -- the book then
+            # re-decides the same thing every cycle and never actually trades.
+            underfunded = [
+                s
+                for s in live
+                if abs(s.target_weight) * equity < min_order
+                and s.spec.nobitex not in self._book
+            ]
             if not underfunded:
                 return
 
@@ -589,6 +711,24 @@ class LiveRunner:
         if usdt and self.fx_state.book:
             total += usdt * self.fx_state.book.mid
         return total
+
+    def _held_symbols(self) -> set[str]:
+        """Symbols we actually own, for incumbency.
+
+        The floor is a dust threshold, not the order minimum: a position sitting
+        just under 3,000,000 rial is still a position we paid to open, and
+        treating it as vacant is what let a freshly bought name be evicted on
+        the next cycle.
+        """
+        min_order = float(self.cfg.costs["min_order_rial"]) * 0.25
+        balances = self.broker.balances()
+        held = set()
+        for symbol, state in self.states.items():
+            base, _ = _split_symbol(symbol)
+            amount = balances.get(base, 0.0)
+            if amount and state.book and amount * state.book.mid >= min_order:
+                held.add(symbol)
+        return held
 
     def stop(self) -> None:
         self._stop.set()

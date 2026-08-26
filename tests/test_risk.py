@@ -309,3 +309,194 @@ def test_drop_unfundable_leaves_a_well_funded_book_alone():
 
     runner._drop_unfundable(states, equity=1_000_000_000)
     assert all(s.target_weight == 0.35 for s in states)
+
+
+def test_a_persisted_halt_does_not_survive_a_healthy_restart():
+    """The bug that made the live bot sell its book every cycle, forever.
+
+    `halted` was saved true after the stale-peak incident, but the peak on disk
+    was plausible against the account, so the stale-peak reset -- the only path
+    that cleared the flag -- never fired. Every symbol then scored
+    `target_weight = 0.0` and the runner liquidated on every pass, silently.
+    """
+    import json
+
+    from nbtrend.live.runner import RunnerState
+
+    path = pathlib.Path(__file__).parent / "_tmp_state3.json"
+    path.write_text(json.dumps({"equity_peak_rial": 9_952_362.0, "halted": True,
+                                "last_bar_ts": {}}))
+    try:
+        state = RunnerState.load(path, current_equity=9_861_642, max_drawdown_stop=0.25)
+        assert not state.halted, "a -0.9% drawdown must not keep the kill switch on"
+        assert state.equity_peak_rial == 9_952_362.0
+    finally:
+        path.unlink()
+
+
+def test_a_halt_survives_a_restart_that_is_still_in_breach():
+    import json
+
+    from nbtrend.live.runner import RunnerState
+
+    path = pathlib.Path(__file__).parent / "_tmp_state4.json"
+    path.write_text(json.dumps({"equity_peak_rial": 10_000_000.0, "halted": True,
+                                "last_bar_ts": {}}))
+    try:
+        # 6M against a 10M peak is -40%, past the 25% stop.
+        state = RunnerState.load(path, current_equity=6_000_000, max_drawdown_stop=0.25)
+        assert state.halted, "restarting must not launder a real drawdown breach"
+    finally:
+        path.unlink()
+
+
+def test_an_incumbent_is_not_evicted_on_a_marginal_score_edge():
+    """Anti-churn. Observed live: CVX was bought one cycle and slated for
+    eviction the next on a few hundredths of score, paying a full round trip
+    (0.22% fees plus a ~0.6% spread) to swap one trending name for another."""
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["risk"]["max_positions"] = 1
+    cfg.raw["execution"]["incumbent_score_bonus"] = 0.10
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    incumbent, challenger = cfg.universe[0], cfg.universe[1]
+    runner._book = {incumbent.nobitex}
+    states = [
+        SymbolState(spec=incumbent, target_weight=0.3, score=0.87),
+        SymbolState(spec=challenger, target_weight=0.3, score=0.90),
+    ]
+
+    runner._limit_positions(states, equity=100_000_000)
+    funded = {s.spec.nobitex for s in states if s.target_weight != 0.0}
+    assert funded == {incumbent.nobitex}, "a 0.03 edge must not pay a round trip"
+
+
+def test_a_decisively_better_challenger_still_takes_the_slot():
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["risk"]["max_positions"] = 1
+    cfg.raw["execution"]["incumbent_score_bonus"] = 0.10
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    incumbent, challenger = cfg.universe[0], cfg.universe[1]
+    runner._book = {incumbent.nobitex}
+    states = [
+        SymbolState(spec=incumbent, target_weight=0.3, score=0.50),
+        SymbolState(spec=challenger, target_weight=0.3, score=0.95),
+    ]
+
+    runner._limit_positions(states, equity=100_000_000)
+    funded = {s.spec.nobitex for s in states if s.target_weight != 0.0}
+    assert funded == {challenger.nobitex}
+
+
+def test_an_incumbent_just_under_the_minimum_keeps_its_slot():
+    """The 3,000,000 rial floor is a minimum ORDER size, not a minimum holding.
+
+    Live stalemate: CVX was held, its vol-targeted size came to 2,970,000, so
+    selection dropped it and handed the slot to a name there was no cash to buy
+    -- while the CVX sell was itself skipped for being under the minimum. The
+    book could not move in either direction.
+    """
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["risk"]["max_positions"] = 1
+    cfg.raw["risk"]["max_weight_per_symbol"] = 1.0
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    incumbent = cfg.universe[0]
+    runner._book = {incumbent.nobitex}
+    equity = 10_000_000
+    # 0.297 * 10,000,000 = 2,970,000 -- just under the 3,000,000 minimum.
+    states = [SymbolState(spec=incumbent, target_weight=0.297, score=0.87)]
+
+    runner._limit_positions(states, equity=equity)
+    assert states[0].target_weight != 0.0, "holding a position places no order"
+
+
+def test_drop_unfundable_leaves_incumbents_alone():
+    """The other half of the CVX stalemate.
+
+    `_limit_positions` was taught that the 3,000,000 rial floor limits orders,
+    not holdings -- but `_drop_unfundable` then dropped the same incumbent a
+    moment later, setting a sell that was itself under the minimum and skipped.
+    The book re-decided the identical trade every cycle and never moved.
+    """
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    incumbent, newcomer = cfg.universe[0], cfg.universe[1]
+    runner._book = {incumbent.nobitex}
+    equity = 10_000_000
+    states = [
+        SymbolState(spec=incumbent, target_weight=0.254, score=0.87),  # 2,540,000
+        SymbolState(spec=newcomer, target_weight=0.10, score=0.80),    # 1,000,000
+    ]
+
+    runner._drop_unfundable(states, equity=equity)
+    assert states[0].target_weight != 0.0, "an owned position needs no order to hold"
+    assert states[1].target_weight == 0.0, "an unowned sub-minimum name is still dropped"
+
+
+def test_startup_equity_values_positions_not_just_cash():
+    """A fully invested account holds almost no rial.
+
+    Marking only the cash made every restart look catastrophic -- observed
+    live, a 9,839,505 peak discarded against an apparent equity of 29,125 --
+    which resets the high-water mark the drawdown stop is measured from.
+    """
+    import copy
+    from types import SimpleNamespace
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    spec = next(s for s in cfg.universe if s.nobitex == "BTCIRT")
+    runner.states = {"BTCIRT": SymbolState(spec=spec)}
+    runner.broker = SimpleNamespace(balances=lambda: {"rls": 29_125.0, "btc": 0.06})
+    runner.rest = SimpleNamespace(orderbook=lambda _s: SimpleNamespace(mid=150_000_000.0))
+
+    equity = runner._safe_equity()
+    assert equity == 29_125.0 + 0.06 * 150_000_000.0
+
+
+def test_startup_equity_survives_an_unmarkable_holding():
+    import copy
+    from types import SimpleNamespace
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    spec = next(s for s in cfg.universe if s.nobitex == "BTCIRT")
+    runner.states = {"BTCIRT": SymbolState(spec=spec)}
+    runner.broker = SimpleNamespace(balances=lambda: {"rls": 29_125.0, "btc": 0.06})
+
+    def _boom(_symbol):
+        raise RuntimeError("orderbook unavailable")
+
+    runner.rest = SimpleNamespace(orderbook=_boom)
+    assert runner._safe_equity() == 29_125.0, "must degrade, not raise"
