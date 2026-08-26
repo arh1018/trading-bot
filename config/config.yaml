@@ -20,6 +20,12 @@ data:
   # book, which costs nothing.
   min_refetch_s: 240
 
+  # Drop a symbol whose global feed has not printed in this long. A delisted
+  # pair does not error -- Binance still serves the last bars it ever had
+  # (XMRUSDT returns February 2024), so the price silently freezes while the
+  # local market keeps moving.
+  max_feed_age_days: 3
+
   # tradingview | binance.
   #
   # TradingView aggregates many venues and needs no key, but its anonymous

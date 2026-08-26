@@ -251,7 +251,9 @@ def test_datasets_are_cached_between_short_cycles():
     feed._min_refetch_s = 300
     calls = {"n": 0}
 
-    idx = pd.date_range("2024-01-01", periods=3, freq="4h", tz="UTC")
+    # Recent bars: the feed drops anything older than max_feed_age_days.
+    idx = pd.date_range(pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=8),
+                        periods=3, freq="4h")
     frame = _frame(idx, [1.0, 2.0, 3.0])
 
     async def fake_build(spec):
@@ -280,7 +282,8 @@ def test_stale_data_is_served_when_a_refetch_fails():
     cfg = load_config()
     feed = DataFeed(cfg)
     feed._min_refetch_s = 0          # force a refetch every time
-    idx = pd.date_range("2024-01-01", periods=3, freq="4h", tz="UTC")
+    idx = pd.date_range(pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=8),
+                        periods=3, freq="4h")
     frame = _frame(idx, [1.0, 2.0, 3.0])
     state = {"fail": False}
 
@@ -296,3 +299,35 @@ def test_stale_data_is_served_when_a_refetch_fails():
     assert len(asyncio.run(feed.build_all(specs))) == 1
     state["fail"] = True
     assert len(asyncio.run(feed.build_all(specs))) == 1, "should serve the cached dataset"
+
+
+def test_a_delisted_feed_is_dropped_rather_than_trusted():
+    """Binance does not error on a delisted pair -- it keeps serving the last
+    bars it ever had. XMRUSDT still returns February 2024 data, so the global
+    price silently freezes while the local market keeps moving."""
+    import asyncio
+
+    from nbtrend.config import load_config
+    from nbtrend.data.feed import DataFeed, SymbolDataset
+
+    cfg = load_config()
+    feed = DataFeed(cfg)
+    feed._min_refetch_s = 0
+
+    frozen = _frame(pd.date_range("2024-02-20", periods=3, freq="4h", tz="UTC"), [1.0, 2.0, 3.0])
+    fresh_idx = pd.date_range(
+        pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=8), periods=3, freq="4h"
+    )
+    fresh = _frame(fresh_idx, [1.0, 2.0, 3.0])
+
+    specs = cfg.enabled_symbols[:2]
+
+    async def build(spec):
+        return SymbolDataset(spec=spec, frame=frozen if spec is specs[0] else fresh)
+
+    feed.build_dataset = build
+    feed.fx_history = lambda days: asyncio.sleep(0, result=fresh)
+
+    out = asyncio.run(feed.build_all(specs))
+    assert specs[0].nobitex not in out, "stale feed should be dropped"
+    assert specs[1].nobitex in out

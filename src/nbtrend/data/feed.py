@@ -79,6 +79,8 @@ class DataFeed:
         # against the live websocket book, which is not rate limited.
         self._dataset_cache: dict[str, tuple[float, SymbolDataset]] = {}
         self._min_refetch_s = float(cfg.data.get("min_refetch_s", 240))
+        # A global feed older than this is treated as dead rather than trusted.
+        self._max_feed_age_s = float(cfg.data.get("max_feed_age_days", 3)) * 86400
 
     async def fx_history(self, days: int) -> pd.DataFrame:
         """USDTIRT candles, fetched once per DataFeed lifetime."""
@@ -190,7 +192,27 @@ class DataFeed:
 
         results = await asyncio.gather(*(one(spec) for spec in specs))
 
-        out = {name: ds for name, ds in results if ds is not None and not ds.frame.empty}
+        out: dict[str, SymbolDataset] = {}
+        stale: list[str] = []
+        for name, ds in results:
+            if ds is None or ds.frame.empty:
+                continue
+            age_s = (pd.Timestamp.now(tz="UTC") - ds.frame.index[-1]).total_seconds()
+            if age_s > self._max_feed_age_s:
+                stale.append(f"{name} ({age_s / 86400:.0f}d)")
+                continue
+            out[name] = ds
+
+        if stale:
+            # A delisted pair does not error -- Binance keeps serving the last
+            # bars it ever had. XMRUSDT still returns February 2024 data. The
+            # basis interlock catches the resulting nonsense, but only after
+            # the symbol has been priced against a frozen quote all cycle.
+            log.warning(
+                "%d symbol(s) have a stale global feed and were dropped "
+                "(likely delisted upstream): %s%s",
+                len(stale), ", ".join(stale[:6]), "..." if len(stale) > 6 else "",
+            )
         failed = [name for name, ds in results if ds is None]
         if failed:
             log.info(

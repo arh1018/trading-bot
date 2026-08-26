@@ -516,7 +516,7 @@ symbols:
   tradingview: CRYPTO:XMRUSD
   amount_step: 1.0e-05
   price_step: 1000
-  enabled: true
+  enabled: false  # delisted from Binance; global feed is frozen
 - nobitex: LAIRT
   src: la
   dst: rls
@@ -677,7 +677,7 @@ symbols:
   tradingview: CRYPTO:LITUSD
   amount_step: 0.001
   price_step: 100
-  enabled: true
+  enabled: false  # delisted from Binance; global feed is frozen
 - nobitex: SANDIRT
   src: sand
   dst: rls
