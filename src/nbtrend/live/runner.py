@@ -322,6 +322,10 @@ class LiveRunner:
                     state.book.mid,
                     float(dataset.frame["close"].iloc[-1]),
                     self.fx_state.book.mid,
+                    # Scaled markets (1K_SHIB, 1M_PEPE, ...) quote a bundle of
+                    # units against a per-unit global feed. Without this the
+                    # basis reads ~99,826% and the market is refused forever.
+                    state.spec.multiplier,
                 )
                 state.basis = basis.basis
                 if abs(basis.basis) > max_basis:
@@ -343,6 +347,9 @@ class LiveRunner:
         # rial and comes back as InsufficientBalance. Scaling every weight by
         # the same factor preserves relative conviction.
         self._cap_gross(tradeable)
+
+        # --- pass 3b: drop anything the gross cap pushed under the minimum ---
+        self._drop_unfundable(tradeable, equity)
 
         # --- pass 4: execute ------------------------------------------------
         # The router polls fills with a blocking `time.sleep` and can spend
@@ -394,6 +401,44 @@ class LiveRunner:
         for state in wanted[limit:]:
             state.target_weight = 0.0
         return states
+
+    def _drop_unfundable(self, states: list[SymbolState], equity: float) -> None:
+        """Remove positions the gross cap pushed below the exchange minimum.
+
+        `_limit_positions` picks how many names an equal split could fund, but
+        the weights are not equal: volatility targeting sizes each name
+        differently and `_cap_gross` then scales the whole book. The result is
+        that a kept name can still land under 3,000,000 rial and be rejected
+        at submission -- observed live, where two of three chosen positions
+        were skipped one at a time.
+
+        Dropping the smallest offender and re-capping frees its weight for the
+        survivors, so the book converges on fewer, fundable positions rather
+        than several unfillable ones.
+        """
+        min_order = float(self.cfg.costs["min_order_rial"])
+        if equity <= 0 or min_order <= 0:
+            return
+
+        for _ in range(len(states)):
+            live = [s for s in states if s.target_weight != 0.0]
+            if not live:
+                return
+
+            underfunded = [s for s in live if abs(s.target_weight) * equity < min_order]
+            if not underfunded:
+                return
+
+            victim = min(underfunded, key=lambda s: abs(s.target_weight))
+            log.info(
+                "%s: %s rial is under the %s minimum after capping; dropping it and "
+                "re-spreading across the rest",
+                victim.spec.nobitex,
+                f"{abs(victim.target_weight) * equity:,.0f}",
+                f"{min_order:,.0f}",
+            )
+            victim.target_weight = 0.0
+            self._cap_gross([s for s in states if s.target_weight != 0.0])
 
     def _cap_gross(self, states: list[SymbolState]) -> None:
         """Scale target weights down so the book respects max_gross_exposure.

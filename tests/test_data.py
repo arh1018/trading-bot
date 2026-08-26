@@ -222,3 +222,17 @@ def test_fx_series_is_fetched_once_not_once_per_symbol():
 
     asyncio.run(run())
     assert calls["n"] == 1, f"FX fetched {calls['n']} times, expected 1"
+
+
+def test_live_runner_passes_multiplier_to_the_basis_check():
+    """The scaled-market multiplier was threaded through the backtest feed but
+    not the live path, so 1K_SHIBIRT reported a 99,826% basis and was refused
+    every cycle."""
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "src" / "nbtrend" / "live" / "runner.py"
+    ).read_text()
+    start = source.index("basis = compute_basis(")
+    call = source[start : start + 600]
+    assert "state.spec.multiplier" in call.split("compute_basis(")[1].split("\n\n")[0]

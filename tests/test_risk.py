@@ -224,3 +224,40 @@ def test_state_path_is_namespaced_by_mode():
         pathlib.Path(__file__).resolve().parents[1] / "src" / "nbtrend" / "live" / "runner.py"
     ).read_text()
     assert 'f"data/state/runner-{cfg.mode}.json"' in source
+
+
+def test_gross_cap_can_push_a_kept_position_under_the_minimum():
+    """Observed live: _limit_positions kept 3 names, then vol targeting and
+    _cap_gross scaled two of them under 3,000,000 rial and both were rejected
+    one at a time. Dropping the smallest frees weight for the survivors."""
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    equity = 9_950_000.0
+    specs = cfg.universe[:3]
+    weights = [0.350, 0.231, 0.197]      # the live numbers
+    states = [SymbolState(spec=s, target_weight=w, score=0.9)
+              for s, w in zip(specs, weights, strict=True)]
+
+    runner._drop_unfundable(states, equity)
+
+    live = [s for s in states if s.target_weight != 0.0]
+    assert live, "should keep at least one fundable position"
+    for s in live:
+        assert s.target_weight * equity >= float(cfg.costs["min_order_rial"])
+
+
+def test_drop_unfundable_leaves_a_well_funded_book_alone():
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    specs = cfg.universe[:2]
+    states = [SymbolState(spec=s, target_weight=0.35, score=0.9) for s in specs]
+
+    runner._drop_unfundable(states, equity=1_000_000_000)
+    assert all(s.target_weight == 0.35 for s in states)
