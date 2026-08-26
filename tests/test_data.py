@@ -236,3 +236,63 @@ def test_live_runner_passes_multiplier_to_the_basis_check():
     start = source.index("basis = compute_basis(")
     call = source[start : start + 600]
     assert "state.spec.multiplier" in call.split("compute_basis(")[1].split("\n\n")[0]
+
+
+def test_datasets_are_cached_between_short_cycles():
+    """At a 2-minute cadence on 4h bars, refetching cannot change a signal --
+    it only spends rate limit, which is what earned a 429 from Nobitex."""
+    import asyncio
+
+    from nbtrend.config import load_config
+    from nbtrend.data.feed import DataFeed, SymbolDataset
+
+    cfg = load_config()
+    feed = DataFeed(cfg)
+    feed._min_refetch_s = 300
+    calls = {"n": 0}
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="4h", tz="UTC")
+    frame = _frame(idx, [1.0, 2.0, 3.0])
+
+    async def fake_build(spec):
+        calls["n"] += 1
+        return SymbolDataset(spec=spec, frame=frame)
+
+    feed.build_dataset = fake_build
+    feed.fx_history = lambda days: asyncio.sleep(0, result=frame)
+
+    specs = cfg.enabled_symbols[:3]
+    asyncio.run(feed.build_all(specs))
+    first = calls["n"]
+    asyncio.run(feed.build_all(specs))          # inside the TTL
+
+    assert first == 3
+    assert calls["n"] == 3, f"refetched inside the TTL ({calls['n']} calls)"
+
+
+def test_stale_data_is_served_when_a_refetch_fails():
+    """One transient fetch failure must not drop a symbol out of the book."""
+    import asyncio
+
+    from nbtrend.config import load_config
+    from nbtrend.data.feed import DataFeed, SymbolDataset
+
+    cfg = load_config()
+    feed = DataFeed(cfg)
+    feed._min_refetch_s = 0          # force a refetch every time
+    idx = pd.date_range("2024-01-01", periods=3, freq="4h", tz="UTC")
+    frame = _frame(idx, [1.0, 2.0, 3.0])
+    state = {"fail": False}
+
+    async def flaky(spec):
+        if state["fail"]:
+            raise RuntimeError("transient")
+        return SymbolDataset(spec=spec, frame=frame)
+
+    feed.build_dataset = flaky
+    feed.fx_history = lambda days: asyncio.sleep(0, result=frame)
+    specs = cfg.enabled_symbols[:1]
+
+    assert len(asyncio.run(feed.build_all(specs))) == 1
+    state["fail"] = True
+    assert len(asyncio.run(feed.build_all(specs))) == 1, "should serve the cached dataset"

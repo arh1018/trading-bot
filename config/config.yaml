@@ -13,6 +13,13 @@ data:
   # rate limits and opens too many TradingView sockets at once.
   max_concurrent_fetches: 8
 
+  # Minimum seconds between refetching a symbol's candles. Signals are derived
+  # from CLOSED bars, so refetching a 4h bar every couple of minutes cannot
+  # change a decision -- it only spends rate limit. Short cycles remain useful
+  # because fills, drift and stops are evaluated against the live websocket
+  # book, which costs nothing.
+  min_refetch_s: 240
+
   # tradingview | binance.
   #
   # TradingView aggregates many venues and needs no key, but its anonymous
@@ -127,6 +134,13 @@ execution:
   # balances inside that window returns pre-trade numbers, which makes the
   # next symbol in the rebalance loop over-estimate available cash. The
   # runner confirms the credit landed instead of assuming a fixed delay.
+  # Wallet reads are cached for this long within a cycle. The rebalance loop
+  # needs balances several times per symbol; uncached, a 25-symbol universe
+  # earns a 429 from /users/wallets/list and loses the whole cycle. Every
+  # order submission and settlement invalidates the cache, so it cannot hide
+  # a fill.
+  balance_ttl_s: 3.0
+
   settlement_poll_s: 0.5      # how often to re-read wallets while confirming
   settlement_timeout_s: 20    # give up confirming after this long
 

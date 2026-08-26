@@ -159,6 +159,7 @@ class LiveRunner:
                 specs,
                 settlement_poll_s=float(self.cfg.execution.get("settlement_poll_s", 0.5)),
                 settlement_timeout_s=float(self.cfg.execution.get("settlement_timeout_s", 20.0)),
+                balance_ttl_s=float(self.cfg.execution.get("balance_ttl_s", 3.0)),
             )
 
         starting = {"rls": float(self.cfg.backtest["initial_equity_rial"])}
@@ -471,7 +472,11 @@ class LiveRunner:
         price = state.book.mid
 
         base, _ = _split_symbol(spec.nobitex)
-        held = self.broker.balances().get(base, 0.0)
+        # One snapshot for the whole decision: holding, spendable cash and the
+        # settlement baseline all come from it. Re-reading per use is what
+        # earned a 429 from /users/wallets/list.
+        balances = self.broker.balances()
+        held = balances.get(base, 0.0)
         current_weight = held * price / equity if equity else 0.0
 
         gap = state.target_weight - current_weight
@@ -494,7 +499,7 @@ class LiveRunner:
             # alongside the cost-adjusted gross cap: rounding, slippage and a
             # moving book can still push the last order of a cycle over.
             cost_rate = float(self.cfg.costs["taker_fee"]) + float(self.cfg.costs["slippage"])
-            cash = self.broker.balances().get("rls", 0.0)
+            cash = balances.get("rls", 0.0)
             affordable = max(0.0, cash / (price * (1.0 + cost_rate)))
             if affordable < delta_amount:
                 log.info(
@@ -511,7 +516,7 @@ class LiveRunner:
             side.value, delta_amount,
         )
         credited = credited_currency(side, base, "rls")
-        baseline = self.broker.balances().get(credited, 0.0)
+        baseline = balances.get(credited, 0.0)
 
         report = self.router.execute(spec, side, delta_amount)
 

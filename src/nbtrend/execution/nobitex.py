@@ -56,6 +56,7 @@ class NobitexBroker:
         dry_run: bool = False,
         settlement_poll_s: float = 0.5,
         settlement_timeout_s: float = 20.0,
+        balance_ttl_s: float = 3.0,
     ):
         if not rest._token:
             raise RuntimeError("NobitexBroker needs an API token; set NOBITEX_API_TOKEN")
@@ -64,12 +65,40 @@ class NobitexBroker:
         self.dry_run = dry_run
         self.settlement_poll_s = settlement_poll_s
         self.settlement_timeout_s = settlement_timeout_s
+        self.balance_ttl_s = balance_ttl_s
+        self._balance_cache: dict[str, float] | None = None
+        self._balance_cache_ts = 0.0
         self._guard = _OrderRateGuard()
         self._by_coid: dict[str, Order] = {}
 
     # -- read --------------------------------------------------------------
-    def balances(self) -> dict[str, float]:
-        return self.rest.wallets()
+    def balances(self, refresh: bool = False) -> dict[str, float]:
+        """Wallet balances, cached for `balance_ttl_s`.
+
+        The rebalance loop reads balances several times per symbol -- current
+        holding, spendable cash, settlement baseline -- so an uncached read is
+        ~3 calls per symbol per cycle. At 25 symbols that is enough to earn a
+        429 from `/users/wallets/list`, which aborts the whole cycle.
+
+        The cache is invalidated on every submission and after settlement, so
+        it never hides a fill; it only collapses the repeated reads that
+        happen within one pass over the book.
+        """
+        now = time.time()
+        if (
+            not refresh
+            and self._balance_cache is not None
+            and now - self._balance_cache_ts < self.balance_ttl_s
+        ):
+            return dict(self._balance_cache)
+
+        fresh = self.rest.wallets()
+        self._balance_cache = fresh
+        self._balance_cache_ts = now
+        return dict(fresh)
+
+    def invalidate_balances(self) -> None:
+        self._balance_cache = None
 
     def book(self, symbol: str) -> BookTop:
         return self.rest.orderbook(symbol)
@@ -103,6 +132,7 @@ class NobitexBroker:
             )
 
         self._guard.check()
+        self.invalidate_balances()
         try:
             order = self.rest.add_order(
                 src=spec.src,
@@ -170,12 +200,14 @@ class NobitexBroker:
         while time.time() < deadline:
             time.sleep(self.settlement_poll_s)
             try:
+                # Deliberately uncached: this is polling for a change.
                 observed = self.rest.wallets([currency]).get(currency, baseline)
             except Exception:
                 log.warning("balance read failed while confirming settlement", exc_info=True)
                 continue
 
             if observed >= target:
+                self.invalidate_balances()
                 log.debug(
                     "%s settled: %.8f -> %.8f (expected +%.8f)",
                     currency, baseline, observed, expected_delta,

@@ -58,6 +58,7 @@ class DataFeed:
         # is 120 identical REST calls per cycle -- slow, and a pointless share
         # of the rate limit.
         self._fx_cache: pd.DataFrame | None = None
+        self._fx_fetched_at = 0.0
         self._fx_lock = asyncio.Lock()
         self._fetch_semaphore = asyncio.Semaphore(
             int(cfg.data.get("max_concurrent_fetches", 8))
@@ -71,12 +72,20 @@ class DataFeed:
         self._tv_failures = 0
         self._tv_disabled = False
         self._tv_failure_limit = int(cfg.data.get("tradingview_failure_limit", 3))
+        # Datasets are cached between cycles. The strategy decides on closed
+        # bars, so refetching 4h candles every 2 minutes cannot change a
+        # signal -- it only burns rate limit, and that is what earns a 429.
+        # Short cycles stay useful because fills, drift and stops are checked
+        # against the live websocket book, which is not rate limited.
+        self._dataset_cache: dict[str, tuple[float, SymbolDataset]] = {}
+        self._min_refetch_s = float(cfg.data.get("min_refetch_s", 240))
 
     async def fx_history(self, days: int) -> pd.DataFrame:
         """USDTIRT candles, fetched once per DataFeed lifetime."""
         async with self._fx_lock:
             if self._fx_cache is None:
                 self._fx_cache = await asyncio.to_thread(self.fetch_local, self.cfg.fx, days)
+                self._fx_fetched_at = time.time()
             return self._fx_cache
 
     def invalidate_fx(self) -> None:
@@ -156,16 +165,28 @@ class DataFeed:
         specs = specs or self.cfg.enabled_symbols
 
         # Warm the shared FX series before fanning out, or the first N workers
-        # all race for the same lock.
+        # all race for the same lock. Expire it on the same clock as datasets.
+        if time.time() - self._fx_fetched_at > self._min_refetch_s:
+            self.invalidate_fx()
         await self.fx_history(int(self.cfg.data.get("history_days", 900)))
 
+        now = time.time()
+
         async def one(spec: SymbolSpec) -> tuple[str, SymbolDataset | None]:
+            cached = self._dataset_cache.get(spec.nobitex)
+            if cached and now - cached[0] < self._min_refetch_s:
+                return spec.nobitex, cached[1]
+
             async with self._fetch_semaphore:
                 try:
-                    return spec.nobitex, await self.build_dataset(spec)
+                    dataset = await self.build_dataset(spec)
+                    self._dataset_cache[spec.nobitex] = (time.time(), dataset)
+                    return spec.nobitex, dataset
                 except Exception as exc:
                     log.warning("failed to build dataset for %s: %s", spec.nobitex, exc)
-                    return spec.nobitex, None
+                    # Serve stale data rather than dropping the symbol from the
+                    # book on one transient failure.
+                    return spec.nobitex, cached[1] if cached else None
 
         results = await asyncio.gather(*(one(spec) for spec in specs))
 

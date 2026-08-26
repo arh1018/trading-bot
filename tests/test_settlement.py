@@ -107,7 +107,10 @@ def test_runner_confirms_settlement_before_the_next_symbol():
         / "src" / "nbtrend" / "live" / "runner.py"
     ).read_text()
     assert "self.broker.await_settlement(credited, baseline, expected)" in source
-    assert "baseline = self.broker.balances().get(credited, 0.0)" in source
+    # The baseline comes from the single cached snapshot taken at the top of
+    # _apply_target -- re-reading wallets per use earned a 429 from Nobitex.
+    assert "baseline = balances.get(credited, 0.0)" in source
+    assert "balances = self.broker.balances()" in source
 
 
 def test_v2_wallets_uses_balance_not_activebalance():
@@ -149,3 +152,53 @@ def test_users_wallets_list_uses_activebalance():
     }
     out = NobitexREST.wallets(api, None)
     assert out["usdt"] == pytest.approx(5.007)
+
+
+def test_balances_are_cached_within_a_cycle():
+    """Uncached, the rebalance loop reads wallets ~3x per symbol; at 25
+    symbols that earns a 429 from /users/wallets/list and loses the cycle."""
+    from nbtrend.execution.nobitex import NobitexBroker
+
+    calls = {"n": 0}
+
+    class _Rest:
+        _token = "t"
+
+        def wallets(self, currencies=None):
+            calls["n"] += 1
+            return {"rls": 1_000.0}
+
+    broker = NobitexBroker(_Rest(), {}, balance_ttl_s=60.0)
+    for _ in range(10):
+        broker.balances()
+    assert calls["n"] == 1, f"{calls['n']} wallet reads, expected 1"
+
+
+def test_a_submission_invalidates_the_balance_cache():
+    """A cache that survives a fill would report pre-trade cash to the next
+    symbol -- the same stale-read failure the settlement wait exists to stop."""
+    from nbtrend.execution.nobitex import NobitexBroker
+
+    class _Rest:
+        _token = "t"
+
+        def wallets(self, currencies=None):
+            return {"rls": 1.0}
+
+    broker = NobitexBroker(_Rest(), {}, balance_ttl_s=60.0)
+    broker.balances()
+    assert broker._balance_cache is not None
+    broker.invalidate_balances()
+    assert broker._balance_cache is None
+
+
+def test_settlement_polling_bypasses_the_cache():
+    """Confirming a credit against a cached value would never observe it."""
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src" / "nbtrend" / "execution" / "nobitex.py"
+    ).read_text()
+    block = source[source.index("def await_settlement") :]
+    assert "self.rest.wallets([currency])" in block, "must read through to the API"

@@ -35,8 +35,12 @@ class PaperBroker:
         self._orders: dict[str, Order] = {}
 
     # -- read --------------------------------------------------------------
-    def balances(self) -> dict[str, float]:
+    def balances(self, refresh: bool = False) -> dict[str, float]:
+        """In-memory ledger; `refresh` exists only to match the live broker."""
         return dict(self._balances)
+
+    def invalidate_balances(self) -> None:
+        return None
 
     def book(self, symbol: str) -> BookTop:
         return self.rest.orderbook(symbol)
