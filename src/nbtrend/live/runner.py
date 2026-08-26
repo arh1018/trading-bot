@@ -342,12 +342,9 @@ class LiveRunner:
         # --- pass 2: keep only as many positions as equity can fund ---------
         tradeable = self._limit_positions(tradeable, equity)
 
-        # --- pass 3: cap gross exposure across the whole book ---------------
-        # Per-symbol caps do not bound the portfolio: four symbols each at the
-        # 0.35 limit is 1.4x gross, which on a spot book simply runs out of
-        # rial and comes back as InsufficientBalance. Scaling every weight by
-        # the same factor preserves relative conviction.
-        self._cap_gross(tradeable)
+        # Gross exposure was already capped inside the selection search above:
+        # it evaluates each candidate book *after* capping, which is the only
+        # way to know whether a position clears the exchange minimum.
 
         # --- pass 3b: drop anything the gross cap pushed under the minimum ---
         self._drop_unfundable(tradeable, equity)
@@ -362,45 +359,77 @@ class LiveRunner:
         self.state.save(self.state_path)
 
     def _limit_positions(self, states: list[SymbolState], equity: float) -> list[SymbolState]:
-        """Keep only as many positions as the account can legally fund.
+        """Choose the book: the most positions that can all actually be funded.
 
-        Nobitex rejects any IRT order under `min_order_rial` (3,000,000).
-        Spreading equity across the whole universe drives every position below
-        that, so a wide universe on a small account places no orders at all --
-        it fails silently, one skip at a time.
+        Nobitex rejects any IRT order under `min_order_rial` (3,000,000), so a
+        wide universe on a small account places nothing -- it fails silently,
+        one skip at a time.
 
-        Instead: rank by conviction, and hold only the top N where N is what
-        the equity supports. A 110-symbol universe still does its job -- it is
-        the opportunity set the signal chooses from -- while the book stays
-        concentrated enough to actually trade. `risk.max_positions` overrides
-        the derived number; 0 means derive it.
+        Ranking by conviction alone is not enough. Volatility targeting sizes
+        each name differently and `_cap_gross` then scales the whole book, so
+        picking the top three and hoping produced one funded position and two
+        rejections in a live run. Instead this searches for the largest k whose
+        top-k selection *survives* gross capping with every position still
+        above the minimum -- the freed weight from a rejected name is exactly
+        what lifts the others over the line.
+
+        The universe therefore stays the opportunity set: widening it improves
+        selection without needing more capital.
         """
         min_order = float(self.cfg.costs["min_order_rial"])
         max_gross = float(self.cfg.risk["max_gross_exposure"])
         configured = int(self.cfg.risk.get("max_positions", 0))
 
-        # How many positions can each clear the minimum, at an equal split?
-        affordable = int((equity * max_gross) // min_order) if min_order > 0 else len(states)
-        limit = configured or affordable
-        limit = max(1, min(limit, affordable if affordable > 0 else 1, len(states)))
-
         wanted = [s for s in states if s.target_weight != 0.0]
-        if len(wanted) <= limit:
+        if not wanted or equity <= 0 or min_order <= 0:
             return states
 
-        # Highest absolute score first -- conviction, not alphabetical order.
+        # Highest conviction first -- score, not alphabetical order.
         wanted.sort(key=lambda s: -abs(s.score))
-        keep = {s.spec.nobitex for s in wanted[:limit]}
-        dropped = [s.spec.nobitex for s in wanted[limit:]]
+        ceiling = int((equity * max_gross) // min_order) or 1
+        limit = min(configured or ceiling, ceiling, len(wanted))
+        original = {id(s): s.target_weight for s in wanted}
 
+        # Greedy by conviction, skipping any name that would break the book.
+        #
+        # Considering only score-ranked *prefixes* is not enough: the top name
+        # may be the volatile one that cannot clear the minimum, which would
+        # veto every larger book behind it and fund nothing -- even when a
+        # lower-ranked name is perfectly fundable on its own. So a candidate
+        # that breaks fundability is skipped, not fatal.
+        selected: list[SymbolState] = []
+        for candidate in wanted:
+            if len(selected) >= limit:
+                break
+
+            trial = [*selected, candidate]
+            for state in trial:
+                state.target_weight = original[id(state)]
+            self._cap_gross(trial)
+
+            if all(abs(s.target_weight) * equity >= min_order for s in trial):
+                selected = trial
+            else:
+                candidate.target_weight = 0.0
+                # Restore the survivors to their last good sizing.
+                for state in selected:
+                    state.target_weight = original[id(state)]
+                self._cap_gross(selected)
+
+        chosen = {id(s) for s in selected}
+        for state in wanted:
+            if id(state) not in chosen:
+                state.target_weight = 0.0
+
+        held = [s.spec.nobitex for s in selected]
+        dropped = [s.spec.nobitex for s in wanted if id(s) not in chosen]
         log.info(
-            "equity %s rial funds %d position(s) at the %s minimum; holding %s, skipping %d other "
-            "signal(s): %s%s",
-            f"{equity:,.0f}", limit, f"{min_order:,.0f}", ", ".join(sorted(keep)), len(dropped),
-            ", ".join(dropped[:6]), "..." if len(dropped) > 6 else "",
+            "equity %s rial funds %d of %d signal(s) at the %s minimum; holding %s%s",
+            f"{equity:,.0f}", len(selected), len(wanted), f"{min_order:,.0f}",
+            ", ".join(held) or "nothing",
+            f"; skipping {len(dropped)} ({', '.join(dropped[:6])}"
+            + ("..." if len(dropped) > 6 else "") + ")" if dropped else "",
         )
-        for state in wanted[limit:]:
-            state.target_weight = 0.0
         return states
 
     def _drop_unfundable(self, states: list[SymbolState], equity: float) -> None:

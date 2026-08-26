@@ -156,9 +156,13 @@ def test_position_limit_is_derived_from_equity():
 
 
 def test_position_limit_keeps_the_highest_conviction_names():
+    """When the cap binds, the surviving book is the highest-scoring names."""
+    import copy
+
     from nbtrend.live.runner import LiveRunner, SymbolState
 
-    cfg = load_config()
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["risk"]["max_positions"] = 2
     runner = object.__new__(LiveRunner)
     runner.cfg = cfg
 
@@ -167,9 +171,53 @@ def test_position_limit_keeps_the_highest_conviction_names():
     states = [SymbolState(spec=s, target_weight=0.3, score=sc)
               for s, sc in zip(specs, scores, strict=True)]
 
-    runner._limit_positions(states, equity=7_000_000)   # funds 2
+    runner._limit_positions(states, equity=100_000_000)
     funded = {s.spec.nobitex for s in states if s.target_weight != 0.0}
     assert funded == {specs[1].nobitex, specs[3].nobitex}
+
+
+def test_selection_declines_rather_than_oversizing():
+    """If even one position cannot clear the minimum at its vol-targeted
+    weight, the book is empty. Scaling a position UP to clear the minimum
+    would take more risk than the model sized for -- silently."""
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    specs = cfg.universe[:5]
+    states = [SymbolState(spec=s, target_weight=0.3, score=0.9) for s in specs]
+
+    # 0.3 x 7,000,000 = 2.1M, under the 3M minimum.
+    runner._limit_positions(states, equity=7_000_000)
+    assert all(s.target_weight == 0.0 for s in states)
+
+
+def test_selection_prefers_a_smaller_fundable_book_to_a_larger_broken_one():
+    """Observed live: top-3 by score produced one fill and two rejections.
+    Freed weight from a dropped name is what lifts the rest over the minimum.
+    """
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    equity = 9_950_000.0
+    specs = cfg.universe[:3]
+    # The live weights: only the largest clears 3M on its own.
+    states = [
+        SymbolState(spec=specs[0], target_weight=0.350, score=0.95),
+        SymbolState(spec=specs[1], target_weight=0.231, score=0.96),
+        SymbolState(spec=specs[2], target_weight=0.197, score=0.93),
+    ]
+    runner._limit_positions(states, equity)
+
+    funded = [s for s in states if s.target_weight != 0.0]
+    assert funded, "should fund at least the one viable position"
+    for s in funded:
+        assert s.target_weight * equity >= float(cfg.costs["min_order_rial"])
 
 
 def test_a_large_account_keeps_every_signal():
