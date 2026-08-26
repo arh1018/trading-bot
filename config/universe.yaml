@@ -1,0 +1,70 @@
+# ---------------------------------------------------------------------------
+# Trading universe.
+#
+# Replace / extend this list with the tokens you want to trade. Only the
+# `nobitex` and `tradingview` fields are mandatory -- everything else has a
+# sane default and can be omitted.
+#
+#   nobitex      Nobitex market symbol, UPPERCASE, no separator (BTCIRT).
+#                Used verbatim for websocket channels and /v3/orderbook.
+#   src / dst    The same market split for the REST trading API
+#                (POST /market/orders/add takes srcCurrency + dstCurrency).
+#   tradingview  Global reference feed, "EXCHANGE:SYMBOL". This is the price
+#                the trend signal is computed on -- pick the most liquid
+#                venue, not the local one.
+#   amount_step  Order size rounding (base asset).
+#   price_step   Price rounding, in RIAL.
+#   enabled      Set false to keep a symbol configured but out of the book.
+# ---------------------------------------------------------------------------
+
+fx:
+  # The rial leg. Every IRT price is decomposed as
+  #   IRT = global_usd * usdt_irt * (1 + local_premium)
+  # so this market is special: it is the FX rate, not a trading target.
+  nobitex: USDTIRT
+  src: usdt
+  dst: rls
+  tradingview: null          # no meaningful global feed for USDT/IRR
+  amount_step: 0.01
+  price_step: 10             # rial
+
+symbols:
+  - nobitex: BTCIRT
+    src: btc
+    dst: rls
+    tradingview: "BINANCE:BTCUSDT"
+    amount_step: 0.000001
+    price_step: 10
+    enabled: true
+
+  - nobitex: ETHIRT
+    src: eth
+    dst: rls
+    tradingview: "BINANCE:ETHUSDT"
+    amount_step: 0.00001
+    price_step: 10
+    enabled: true
+
+  - nobitex: SOLIRT
+    src: sol
+    dst: rls
+    tradingview: "BINANCE:SOLUSDT"
+    amount_step: 0.001
+    price_step: 10
+    enabled: true
+
+  - nobitex: XRPIRT
+    src: xrp
+    dst: rls
+    tradingview: "BINANCE:XRPUSDT"
+    amount_step: 0.1
+    price_step: 1
+    enabled: true
+
+  - nobitex: DOGEIRT
+    src: doge
+    dst: rls
+    tradingview: "BINANCE:DOGEUSDT"
+    amount_step: 1
+    price_step: 1
+    enabled: false

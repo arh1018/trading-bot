@@ -1,0 +1,121 @@
+# ===========================================================================
+# nbtrend -- trend following on Nobitex rial markets
+# ===========================================================================
+
+data:
+  # Bar size the strategy runs on. Trading costs on Nobitex (see `costs`)
+  # are ~0.5% round trip, so sub-hourly trend following is not viable.
+  timeframe: "240"            # Nobitex/TV resolution: 60,180,240,360,720,D
+  warmup_bars: 400            # bars of history needed before the first signal
+  history_days: 900           # how far back `nbtrend fetch` pulls
+  cache_dir: "data/candles"
+
+  global_feed: "tradingview"  # tradingview | binance  (see data/README notes)
+  tradingview:
+    # Unofficial, unauthenticated TradingView datafeed. No key required.
+    # It is scraped, not contractual -- `binance` is the drop-in fallback.
+    ws_url: "wss://data.tradingview.com/socket.io/websocket?from=chart%2F"
+    origin: "https://www.tradingview.com"
+    auth_token: "unauthorized_user_token"
+    max_bars: 5000
+    timeout_s: 30
+
+  nobitex:
+    rest_url: "https://apiv2.nobitex.ir"
+    testnet_rest_url: "https://testnetapi.nobitex.ir"
+    ws_url: "wss://ws.nobitex.ir/connection/websocket"
+    testnet_ws_url: "wss://testnetws.nobitex.ir/connection/websocket"
+
+# ---------------------------------------------------------------------------
+# Signal. The composite score is a weighted blend of three trend estimators,
+# each mapped to [-1, +1], computed on the GLOBAL (USD) price series.
+# See docs in src/nbtrend/features/signals.py for the reasoning.
+# ---------------------------------------------------------------------------
+strategy:
+  name: "trend_following"
+
+  signal:
+    # Baz et al. (2015) normalised MACD -- the standard CTA trend metric.
+    macd:
+      weight: 0.5
+      pairs: [[8, 24], [16, 48], [32, 96]]   # (fast, slow) EMA halflives
+      short_norm_window: 63                  # std window for the raw MACD
+      long_norm_window: 252                  # std window for the normalised
+    # Time-series momentum, volatility-scaled (Moskowitz/Ooi/Pedersen 2012).
+    tsmom:
+      weight: 0.3
+      lookbacks: [30, 60, 120]
+      vol_window: 60
+    # Donchian channel breakout (Turtle). Pure price-level trend.
+    donchian:
+      weight: 0.2
+      window: 55
+      exit_window: 20
+
+  # Regime gate: below this Kaufman efficiency ratio the market is chopping
+  # and every trend estimator is noise. Signal is forced to flat.
+  regime:
+    efficiency_ratio_window: 30
+    min_efficiency_ratio: 0.25
+    adx_window: 14
+    min_adx: 18.0
+
+  # Hysteresis. Enter only above `entry`, exit only below `exit`. The gap is
+  # what stops the book churning when the score oscillates around a level.
+  thresholds:
+    entry: 0.30
+    exit: 0.10
+
+  # Spot IRT markets cannot be sold short, so the default book is long/flat.
+  # Set to true only if you have enabled Nobitex margin trading.
+  allow_short: false
+
+# ---------------------------------------------------------------------------
+risk:
+  target_annual_vol: 0.35      # portfolio vol target (rial terms)
+  max_weight_per_symbol: 0.35  # of equity
+  max_gross_exposure: 1.0      # no leverage on spot
+  vol_window: 30               # bars, realised-vol estimate for sizing
+  atr_window: 20
+  atr_stop_mult: 3.0           # chandelier trailing stop
+  max_drawdown_stop: 0.25      # flatten the book past this equity drawdown
+
+  # The rial leg is a one-way carry: holding rial has historically lost value
+  # against USD. `fx_floor_weight` keeps a minimum crypto allocation so that
+  # being "flat" is not silently a 100% short-rial-devaluation bet.
+  fx_floor_weight: 0.0
+
+# ---------------------------------------------------------------------------
+costs:
+  # Nobitex spot fees depend on your 30-day volume tier. These are the
+  # account's actual rates (0.11%), not the 0.25%/0.30% entry-level defaults --
+  # a ~2.5x difference that changes which timeframes are viable at all.
+  # Re-check after any tier change; the whole cost argument below depends on it.
+  maker_fee: 0.0011
+  taker_fee: 0.0011
+  # Modelled slippage as a fraction of price, applied on top of the fee.
+  slippage: 0.0010
+  min_order_rial: 3000000      # exchange minimum for IRT markets (300k Toman)
+
+execution:
+  # No-trade band. Vol targeting makes the target weight drift a little every
+  # bar; without a band the book rebalances continuously and pays ~0.4% each
+  # time for a position change too small to matter. Only trade when the gap
+  # between current and target weight exceeds this fraction of equity.
+  min_rebalance_weight: 0.05
+
+  order_type: "limit"          # limit | market
+  limit_offset_bps: 5          # how far through the touch to post a limit
+  repost_after_s: 45           # re-price an unfilled limit after this long
+  max_reposts: 4               # then cross the spread
+  poll_interval_s: 5
+  # Refuse to trade if Nobitex's price deviates from global*fx by more than
+  # this. Protects against stale feeds and local dislocations.
+  max_basis_deviation: 0.05
+
+backtest:
+  initial_equity_rial: 1000000000   # 1e9 rial = 100M toman
+  # Walk-forward: fit params on `train_days`, trade the next `test_days`,
+  # roll forward. This is how `nbtrend optimize` avoids curve fitting.
+  train_days: 365
+  test_days: 90
