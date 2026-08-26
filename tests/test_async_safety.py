@@ -14,8 +14,6 @@ import asyncio
 import pathlib
 import time
 
-import pytest
-
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "nbtrend"
 
 

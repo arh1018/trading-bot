@@ -253,7 +253,7 @@ src/nbtrend/
   live/runner.py         the trading loop
   cli.py                 nbtrend <command>
 scripts/shadow_test.py   full-stack dry run against real markets
-tests/                   64 tests
+tests/                   74 tests
 ```
 
 ### Data sources
@@ -273,7 +273,7 @@ TradingView is cheap insurance.
 ## Testing
 
 ```bash
-make test    # 64 tests
+make test    # 74 tests
 make lint
 ```
 

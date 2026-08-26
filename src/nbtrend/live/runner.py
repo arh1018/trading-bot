@@ -279,15 +279,25 @@ class LiveRunner:
         self.state.save(self.state_path)
 
     def _cap_gross(self, states: list[SymbolState]) -> None:
-        """Scale target weights down so the book respects max_gross_exposure."""
-        max_gross = float(self.cfg.risk["max_gross_exposure"])
+        """Scale target weights down so the book respects max_gross_exposure.
+
+        The cap is reduced by a cost allowance first. Fees are charged on top
+        of notional, so investing exactly 100% of equity needs 100% + fees in
+        cash and overdraws the rial balance -- observed in a shadow test as a
+        -0.2% `rls` position, which live would be an InsufficientBalance
+        rejection on the last order of the cycle.
+        """
+        cost_rate = float(self.cfg.costs["taker_fee"]) + float(self.cfg.costs["slippage"])
+        max_gross = float(self.cfg.risk["max_gross_exposure"]) / (1.0 + cost_rate)
+
         gross = sum(abs(s.target_weight) for s in states)
         if gross <= max_gross or gross == 0:
             return
 
         factor = max_gross / gross
         log.info(
-            "gross exposure %.2f exceeds the %.2f limit; scaling every weight by %.3f",
+            "gross exposure %.3f exceeds the %.3f cost-adjusted limit; "
+            "scaling every weight by %.4f",
             gross, max_gross, factor,
         )
         for state in states:
@@ -317,6 +327,21 @@ class LiveRunner:
         side = Side.BUY if gap > 0 else Side.SELL
         if side is Side.SELL:
             delta_amount = min(delta_amount, held)
+        else:
+            # Never submit a buy the rial balance cannot fund. Belt and braces
+            # alongside the cost-adjusted gross cap: rounding, slippage and a
+            # moving book can still push the last order of a cycle over.
+            cost_rate = float(self.cfg.costs["taker_fee"]) + float(self.cfg.costs["slippage"])
+            cash = self.broker.balances().get("rls", 0.0)
+            affordable = max(0.0, cash / (price * (1.0 + cost_rate)))
+            if affordable < delta_amount:
+                log.info(
+                    "%s: trimming buy %.8f -> %.8f, only %s rial of cash",
+                    spec.nobitex, delta_amount, affordable, f"{cash:,.0f}",
+                )
+                delta_amount = round_to_step(affordable, spec.amount_step)
+            if delta_amount <= 0:
+                return
 
         log.info(
             "%s: score %+.2f | weight %.3f -> %.3f | %s %.8f",

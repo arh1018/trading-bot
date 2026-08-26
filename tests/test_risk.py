@@ -79,7 +79,10 @@ def test_live_runner_caps_gross_exposure():
     runner._cap_gross(states)
 
     gross = sum(s.target_weight for s in states)
-    assert gross == pytest.approx(float(cfg.risk["max_gross_exposure"]))
+    # At or just under the cap -- `_cap_gross` also reserves a cost allowance,
+    # see test_gross_cap_reserves_cash_for_fees.
+    assert gross <= float(cfg.risk["max_gross_exposure"])
+    assert gross == pytest.approx(float(cfg.risk["max_gross_exposure"]), rel=0.01)
     # Relative conviction preserved.
     assert states[0].target_weight > states[3].target_weight
 
@@ -110,3 +113,22 @@ def test_drawdown_kill_switch():
     breached = drawdown_breached(equity, 0.25)
     assert not breached.iloc[2]
     assert breached.iloc[3]
+
+
+def test_gross_cap_reserves_cash_for_fees():
+    """Investing exactly 100% of equity overdraws, because fees are charged on
+    top of notional. Observed in a shadow test as a negative `rls` balance."""
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    states = [SymbolState(spec=cfg.symbol("BTCIRT"), target_weight=w) for w in (0.35, 0.35, 0.35, 0.277)]
+    runner._cap_gross(states)
+
+    gross = sum(s.target_weight for s in states)
+    cost_rate = float(cfg.costs["taker_fee"]) + float(cfg.costs["slippage"])
+    assert gross < float(cfg.risk["max_gross_exposure"])
+    # Enough cash left to pay the fees on the whole book.
+    assert 1.0 - gross >= gross * cost_rate * 0.99
