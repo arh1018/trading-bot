@@ -17,7 +17,10 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from nbtrend.data.nobitex_auth import (
-    NobitexAPIKeyAuth, NobitexAuthError, decode_key, signing_payload,
+    NobitexAPIKeyAuth,
+    NobitexAuthError,
+    decode_key,
+    signing_payload,
 )
 
 # Nobitex's own documented example keys.
