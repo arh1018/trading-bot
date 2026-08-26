@@ -228,6 +228,13 @@ def basis(log_level: str = typer.Option("WARNING")) -> None:
 @app.command()
 def run(
     once: bool = typer.Option(False, help="Run a single rebalance and exit."),
+    minutes: float | None = typer.Option(None, help="Stop after this many minutes."),
+    interval: float | None = typer.Option(
+        None, help="Seconds between cycles (default: wait for the next bar close)."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the live-mode confirmation prompt."
+    ),
     log_level: str = typer.Option("INFO"),
 ) -> None:
     """Start the trading loop. Honours NBTREND_MODE (paper | live)."""
@@ -236,7 +243,9 @@ def run(
 
     if cfg.is_live:
         console.print("[bold red]LIVE MODE[/bold red] -- real orders will be placed.")
-        if not typer.confirm("Continue?"):
+        # A non-interactive run (background, cron) has no stdin to prompt on,
+        # so --yes is required rather than silently proceeding.
+        if not yes and not typer.confirm("Continue?"):
             raise typer.Abort()
     else:
         console.print("[bold green]PAPER MODE[/bold green] -- no orders leave this process.")
@@ -244,7 +253,7 @@ def run(
     from .live.runner import LiveRunner
     runner = LiveRunner(cfg)
     try:
-        asyncio.run(runner.run(once=once))
+        asyncio.run(runner.run(once=once, minutes=minutes, interval_s=interval))
     except KeyboardInterrupt:
         console.print("\nstopped")
 

@@ -1,5 +1,7 @@
 """Sizing and portfolio-level exposure limits."""
 
+import pathlib
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -132,3 +134,93 @@ def test_gross_cap_reserves_cash_for_fees():
     assert gross < float(cfg.risk["max_gross_exposure"])
     # Enough cash left to pay the fees on the whole book.
     assert 1.0 - gross >= gross * cost_rate * 0.99
+
+
+def test_position_limit_is_derived_from_equity():
+    """A wide universe on a small account otherwise places no orders at all:
+    every position falls under the 3,000,000 rial minimum and is skipped."""
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    specs = cfg.universe[:10]
+    states = [SymbolState(spec=s, target_weight=0.3, score=0.9 - i * 0.05)
+              for i, s in enumerate(specs)]
+
+    # 10M rial / 3M minimum -> 3 fundable positions.
+    runner._limit_positions(states, equity=10_000_000)
+    funded = [s for s in states if s.target_weight != 0.0]
+    assert len(funded) == 3
+
+
+def test_position_limit_keeps_the_highest_conviction_names():
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    specs = cfg.universe[:5]
+    scores = [0.1, 0.9, 0.3, 0.8, 0.2]
+    states = [SymbolState(spec=s, target_weight=0.3, score=sc)
+              for s, sc in zip(specs, scores, strict=True)]
+
+    runner._limit_positions(states, equity=7_000_000)   # funds 2
+    funded = {s.spec.nobitex for s in states if s.target_weight != 0.0}
+    assert funded == {specs[1].nobitex, specs[3].nobitex}
+
+
+def test_a_large_account_keeps_every_signal():
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    specs = cfg.universe[:5]
+    states = [SymbolState(spec=s, target_weight=0.3, score=0.5) for s in specs]
+
+    runner._limit_positions(states, equity=10_000_000_000)
+    assert all(s.target_weight != 0.0 for s in states)
+
+
+def test_paper_equity_peak_cannot_halt_a_live_account():
+    """A paper run ends with a 1e9 peak. Loaded into a live account holding
+    10M that reads as -99% and trips the kill switch before the first order --
+    observed live."""
+    import json
+
+    from nbtrend.live.runner import RunnerState
+
+    path = pathlib.Path(__file__).parent / "_tmp_state.json"
+    path.write_text(json.dumps({"equity_peak_rial": 1_000_000_000.0, "halted": True,
+                                "last_bar_ts": {}}))
+    try:
+        state = RunnerState.load(path, current_equity=9_950_000)
+        assert state.equity_peak_rial == 9_950_000
+        assert not state.halted
+    finally:
+        path.unlink()
+
+
+def test_a_plausible_peak_survives_reload():
+    import json
+
+    from nbtrend.live.runner import RunnerState
+
+    path = pathlib.Path(__file__).parent / "_tmp_state2.json"
+    path.write_text(json.dumps({"equity_peak_rial": 11_000_000.0, "halted": False,
+                                "last_bar_ts": {}}))
+    try:
+        state = RunnerState.load(path, current_equity=9_950_000)
+        assert state.equity_peak_rial == 11_000_000.0
+    finally:
+        path.unlink()
+
+
+def test_state_path_is_namespaced_by_mode():
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "src" / "nbtrend" / "live" / "runner.py"
+    ).read_text()
+    assert 'f"data/state/runner-{cfg.mode}.json"' in source

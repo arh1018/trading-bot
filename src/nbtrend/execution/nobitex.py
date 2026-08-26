@@ -189,8 +189,22 @@ class NobitexBroker:
         return False
 
     def _reconcile(self, coid: str) -> Order | None:
-        """Did the order land despite the error?"""
+        """Did the order land despite the error?
+
+        `clientOrderId` lookup only searches open/active/inactive orders, so it
+        answers exactly the question that matters after a failed submit: is
+        there a live order out there we do not know about? A miss means either
+        nothing was placed or it already filled -- the order list is checked as
+        a second pass to tell those apart.
+        """
         try:
             return self.rest.order_status(client_order_id=coid)
         except Exception:
-            return None
+            pass
+        try:
+            for order in self.rest.open_orders():
+                if order.client_order_id == coid:
+                    return order
+        except Exception:
+            log.warning("could not reconcile %s against the order list", coid, exc_info=True)
+        return None

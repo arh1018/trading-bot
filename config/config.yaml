@@ -87,6 +87,13 @@ risk:
   target_annual_vol: 0.35      # portfolio vol target (rial terms)
   max_weight_per_symbol: 0.35  # of equity
   max_gross_exposure: 1.0      # no leverage on spot
+
+  # Cap on concurrent positions. 0 = derive it from equity, as
+  # floor(equity * max_gross / min_order_rial): the most positions that can
+  # each clear Nobitex's 3,000,000 rial minimum. This is what lets a wide
+  # universe run on a small account -- the universe stays the opportunity set
+  # and the book holds only the highest-conviction names that can be funded.
+  max_positions: 0
   vol_window: 30               # bars, realised-vol estimate for sizing
   atr_window: 20
   atr_stop_mult: 3.0           # chandelier trailing stop

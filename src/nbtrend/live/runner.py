@@ -71,6 +71,10 @@ class SymbolState:
 @dataclass
 class RunnerState:
     """Persisted across restarts so a crash does not lose the book."""
+
+    STALE_PEAK_FACTOR = 3.0
+    """Discard a stored peak more than this multiple above current equity."""
+
     equity_peak_rial: float = 0.0
     halted: bool = False
     last_bar_ts: dict[str, int] = field(default_factory=dict)
@@ -80,14 +84,33 @@ class RunnerState:
         path.write_text(json.dumps(asdict(self), indent=2))
 
     @classmethod
-    def load(cls, path: Path) -> RunnerState:
+    def load(cls, path: Path, current_equity: float | None = None) -> RunnerState:
+        """Restore persisted state, discarding a peak that cannot belong here.
+
+        `equity_peak_rial` is only meaningful for the account and mode that
+        produced it. A paper run ends with a peak of 1e9 (the configured paper
+        bankroll); loading that into a live account holding 10M reads as a 99%
+        drawdown and trips the kill switch before the first order is placed.
+        State is namespaced by mode to prevent that, and this is the backstop
+        for a stale file, a withdrawal, or a changed paper bankroll.
+        """
         if not path.exists():
             return cls()
         try:
-            return cls(**json.loads(path.read_text()))
+            state = cls(**json.loads(path.read_text()))
         except Exception:
             log.warning("could not read %s; starting with fresh state", path)
             return cls()
+
+        if current_equity and state.equity_peak_rial > current_equity * cls.STALE_PEAK_FACTOR:
+            log.warning(
+                "stored equity peak %s rial is implausible against current equity %s; "
+                "resetting rather than tripping the drawdown stop",
+                f"{state.equity_peak_rial:,.0f}", f"{current_equity:,.0f}",
+            )
+            state.equity_peak_rial = current_equity
+            state.halted = False
+        return state
 
 
 class LiveRunner:
@@ -108,10 +131,23 @@ class LiveRunner:
             self.broker, cfg.execution, float(cfg.costs["min_order_rial"])
         )
 
-        self.state_path = Path("data/state/runner.json")
-        self.state = RunnerState.load(self.state_path)
+        # Namespaced by mode: a paper peak must never gate a live account.
+        self.state_path = Path(f"data/state/runner-{cfg.mode}.json")
+        self.state = RunnerState.load(self.state_path, self._safe_equity())
         self.ws = NobitexWS(cfg.ws_url)
         self._stop = asyncio.Event()
+
+    def _safe_equity(self) -> float | None:
+        """Best-effort rial equity for the stale-peak check.
+
+        Runs before the main loop, so it must never raise: a failure here
+        should skip the check, not stop the bot starting.
+        """
+        try:
+            return self.broker.balances().get("rls", 0.0) or None
+        except Exception:
+            log.debug("could not read balances while loading state", exc_info=True)
+            return None
 
     def _build_broker(self) -> Broker:
         if self.cfg.is_live:
@@ -166,9 +202,25 @@ class LiveRunner:
         return handler
 
     # -- main loop ---------------------------------------------------------
-    async def run(self, once: bool = False) -> None:
+    async def run(
+        self,
+        once: bool = False,
+        minutes: float | None = None,
+        interval_s: float | None = None,
+    ) -> None:
+        """Drive the strategy.
+
+        By default the decision clock is the strategy bar, which is what the
+        backtest validated. `minutes` bounds the session and `interval_s`
+        overrides the cadence -- useful for a supervised live run shorter than
+        one bar, where sleeping to the next 4h close would waste the session.
+        Recomputing faster than the bar does not change the signal (it is
+        derived from closed bars), it just re-checks fills and drift.
+        """
         self._wire()
         ws_task = asyncio.create_task(self.ws.run(self._stop))
+
+        deadline = time.time() + minutes * 60 if minutes else None
 
         try:
             await self._await_books(timeout_s=45)
@@ -180,7 +232,21 @@ class LiveRunner:
 
                 if once:
                     break
-                await self._sleep_until_next_bar()
+                if deadline and time.time() >= deadline:
+                    log.info("session limit of %.0f minutes reached", minutes)
+                    break
+
+                if interval_s:
+                    wait = interval_s
+                    if deadline:
+                        wait = min(wait, max(0.0, deadline - time.time()))
+                    if wait <= 0:
+                        break
+                    log.info("next cycle in %.0fs", wait)
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self._stop.wait(), timeout=wait)
+                else:
+                    await self._sleep_until_next_bar()
         finally:
             self._stop.set()
             ws_task.cancel()
@@ -268,14 +334,17 @@ class LiveRunner:
 
             tradeable.append(state)
 
-        # --- pass 2: cap gross exposure across the whole book ---------------
+        # --- pass 2: keep only as many positions as equity can fund ---------
+        tradeable = self._limit_positions(tradeable, equity)
+
+        # --- pass 3: cap gross exposure across the whole book ---------------
         # Per-symbol caps do not bound the portfolio: four symbols each at the
         # 0.35 limit is 1.4x gross, which on a spot book simply runs out of
         # rial and comes back as InsufficientBalance. Scaling every weight by
         # the same factor preserves relative conviction.
         self._cap_gross(tradeable)
 
-        # --- pass 3: execute ------------------------------------------------
+        # --- pass 4: execute ------------------------------------------------
         # The router polls fills with a blocking `time.sleep` and can spend
         # `repost_after_s` (45s) per attempt. Run it off the event loop so the
         # websocket keeps answering Centrifugo's 25s ping.
@@ -283,6 +352,48 @@ class LiveRunner:
             await asyncio.to_thread(self._apply_target, state, equity)
 
         self.state.save(self.state_path)
+
+    def _limit_positions(self, states: list[SymbolState], equity: float) -> list[SymbolState]:
+        """Keep only as many positions as the account can legally fund.
+
+        Nobitex rejects any IRT order under `min_order_rial` (3,000,000).
+        Spreading equity across the whole universe drives every position below
+        that, so a wide universe on a small account places no orders at all --
+        it fails silently, one skip at a time.
+
+        Instead: rank by conviction, and hold only the top N where N is what
+        the equity supports. A 110-symbol universe still does its job -- it is
+        the opportunity set the signal chooses from -- while the book stays
+        concentrated enough to actually trade. `risk.max_positions` overrides
+        the derived number; 0 means derive it.
+        """
+        min_order = float(self.cfg.costs["min_order_rial"])
+        max_gross = float(self.cfg.risk["max_gross_exposure"])
+        configured = int(self.cfg.risk.get("max_positions", 0))
+
+        # How many positions can each clear the minimum, at an equal split?
+        affordable = int((equity * max_gross) // min_order) if min_order > 0 else len(states)
+        limit = configured or affordable
+        limit = max(1, min(limit, affordable if affordable > 0 else 1, len(states)))
+
+        wanted = [s for s in states if s.target_weight != 0.0]
+        if len(wanted) <= limit:
+            return states
+
+        # Highest absolute score first -- conviction, not alphabetical order.
+        wanted.sort(key=lambda s: -abs(s.score))
+        keep = {s.spec.nobitex for s in wanted[:limit]}
+        dropped = [s.spec.nobitex for s in wanted[limit:]]
+
+        log.info(
+            "equity %s rial funds %d position(s) at the %s minimum; holding %s, skipping %d other "
+            "signal(s): %s%s",
+            f"{equity:,.0f}", limit, f"{min_order:,.0f}", ", ".join(sorted(keep)), len(dropped),
+            ", ".join(dropped[:6]), "..." if len(dropped) > 6 else "",
+        )
+        for state in wanted[limit:]:
+            state.target_weight = 0.0
+        return states
 
     def _cap_gross(self, states: list[SymbolState]) -> None:
         """Scale target weights down so the book respects max_gross_exposure.

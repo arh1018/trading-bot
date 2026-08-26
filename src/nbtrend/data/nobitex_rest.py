@@ -258,18 +258,35 @@ class NobitexREST:
     def order_status(
         self, order_id: int | None = None, client_order_id: str | None = None
     ) -> Order:
+        """Fetch one order.
+
+        The field is `id`, NOT `order`. Nobitex's own parameter table says
+        `order`, but the endpoint ignores it -- note 2 of the same section and
+        the `NullIdAndClientOrderId` error code both say `id`, and the live API
+        agrees. Sending `order` yields "Both id and clientOrderId cannot be
+        null" or a bare 404.
+
+        `clientOrderId` is only searched among open/active/inactive orders, so
+        it cannot look up an order that has already filled. Prefer the numeric
+        id whenever it is known.
+        """
         if order_id is None and client_order_id is None:
             raise ValueError("pass order_id or client_order_id")
-        payload = {k: v for k, v in {"order": order_id, "clientOrderId": client_order_id}.items() if v}
+        payload: dict[str, Any] = {}
+        if order_id is not None:
+            payload["id"] = order_id
+        if client_order_id is not None:
+            payload["clientOrderId"] = client_order_id
         data = self._post("/market/orders/status", payload)
         return _parse_order(data["order"], "")
 
     def cancel_order(
         self, order_id: int | None = None, client_order_id: str | None = None
     ) -> bool:
+        # `id`, not `order` -- same stale-docs trap as `order_status`.
         payload: dict[str, Any] = {"status": "canceled"}
         if order_id is not None:
-            payload["order"] = order_id
+            payload["id"] = order_id
         if client_order_id is not None:
             payload["clientOrderId"] = client_order_id
         return self._post("/market/orders/update-status", payload).get("status") == "ok"

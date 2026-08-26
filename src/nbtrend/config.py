@@ -154,7 +154,13 @@ def load_config(
     _load_dotenv(PROJECT_ROOT / ".env")
 
     config_path = Path(config_path or PROJECT_ROOT / "config" / "config.yaml")
-    universe_path = Path(universe_path or PROJECT_ROOT / "config" / "universe.yaml")
+    # NBTREND_UNIVERSE selects an alternative symbol list without editing the
+    # default one -- e.g. a small live book against the full research universe.
+    universe_path = Path(
+        universe_path
+        or os.environ.get("NBTREND_UNIVERSE")
+        or PROJECT_ROOT / "config" / "universe.yaml"
+    )
 
     raw = yaml.safe_load(config_path.read_text())
     uni = yaml.safe_load(universe_path.read_text())
