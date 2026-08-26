@@ -496,7 +496,7 @@ symbols:
     tradingview: "CRYPTO:BABYDOGEUSD"
     amount_step: 0.01
     price_step: 10
-    enabled: true
+    enabled: false  # no global feed: not on Binance, no CRYPTO:*USD index
     multiplier: 1000000000
   #     0.04T rial 24h volume
   - nobitex: FILIRT
@@ -905,7 +905,7 @@ symbols:
     tradingview: "CRYPTO:MEWUSD"
     amount_step: 0.1
     price_step: 1
-    enabled: true
+    enabled: false  # no global feed: not on Binance, no CRYPTO:*USD index
   #     0.01T rial 24h volume
   - nobitex: KITEIRT
     src: kite
