@@ -106,3 +106,44 @@ def test_runner_confirms_settlement_before_the_next_symbol():
     ).read_text()
     assert "self.broker.await_settlement(credited, baseline, expected)" in source
     assert "baseline = self.broker.balances().get(credited, 0.0)" in source
+
+
+def test_v2_wallets_uses_balance_not_activebalance():
+    """Nobitex's two wallet endpoints do NOT share a schema.
+
+    /v2/wallets  -> {"USDT": {"balance": "5.007", "blocked": "0"}}   UPPERCASE keys
+    /users/wallets/list -> [{"currency": "usdt", "activeBalance": "5.007", ...}]
+
+    Reading `activeBalance` from /v2/wallets returns 0 for every currency,
+    which reads as an empty account: the cash clamp then trims every buy to
+    zero and settlement confirmation never observes a credit.
+    """
+    from nbtrend.data.nobitex_rest import NobitexREST
+
+    api = object.__new__(NobitexREST)
+    api._get = lambda path, **kw: {
+        "status": "ok",
+        "wallets": {
+            "RLS": {"id": 1, "balance": "609.012626075", "blocked": "0"},
+            "USDT": {"id": 2, "balance": "5.007048", "blocked": "1.0"},
+        },
+    }
+
+    out = NobitexREST.wallets(api, ["rls", "usdt"])
+    assert out["rls"] == pytest.approx(609.012626075)
+    # Blocked funds are committed to open orders and are not spendable.
+    assert out["usdt"] == pytest.approx(4.007048)
+
+
+def test_users_wallets_list_uses_activebalance():
+    from nbtrend.data.nobitex_rest import NobitexREST
+
+    api = object.__new__(NobitexREST)
+    api._get = lambda path, **kw: {
+        "wallets": [
+            {"currency": "rls", "activeBalance": "609.01", "balance": "609.01"},
+            {"currency": "usdt", "activeBalance": "5.007", "balance": "6.007"},
+        ]
+    }
+    out = NobitexREST.wallets(api, None)
+    assert out["usdt"] == pytest.approx(5.007)

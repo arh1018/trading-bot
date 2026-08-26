@@ -207,7 +207,16 @@ class NobitexREST:
         if currencies:
             data = self._get("/v2/wallets", currencies=",".join(currencies))
             wallets = data.get("wallets", {})
-            return {k.lower(): float(v.get("activeBalance", 0)) for k, v in wallets.items()}
+            # The two wallet endpoints do NOT share a schema. /v2/wallets keys
+            # by UPPERCASE currency and reports `balance` + `blocked`, with no
+            # `activeBalance` field at all -- reading `activeBalance` here
+            # silently returns 0 for every currency, which reads as an empty
+            # account and makes the bot refuse to trade. /users/wallets/list
+            # below is the one that has `activeBalance`.
+            return {
+                k.lower(): float(v.get("balance", 0)) - float(v.get("blocked", 0))
+                for k, v in wallets.items()
+            }
         data = self._get("/users/wallets/list")
         return {
             w["currency"].lower(): float(w.get("activeBalance", 0))
