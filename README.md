@@ -205,6 +205,14 @@ The live runner refuses to trade — rather than guessing — when:
 | order too small | below the 3,000,000 rial IRT minimum → skip |
 | order rate | local guard for the 300 orders / 10 min shared limit |
 
+The runner is `asyncio`-based and the Nobitex websocket must answer
+Centrifugo's ping within **25 seconds** or the connection is dropped. The
+router polls fills with a blocking `time.sleep` (up to `repost_after_s` = 45s
+per attempt) and the REST client is synchronous, so both run via
+`asyncio.to_thread` — running either on the event loop starves the pong
+handler and kills the feed mid-rebalance. `tests/test_async_safety.py` guards
+this, including a control case that reproduces the starvation.
+
 Order submission is **never retried** on transport error — a retried POST that
 actually succeeded places the order twice. Every order carries a
 `clientOrderId` so a timed-out request is reconciled instead.
@@ -245,7 +253,7 @@ src/nbtrend/
   live/runner.py         the trading loop
   cli.py                 nbtrend <command>
 scripts/shadow_test.py   full-stack dry run against real markets
-tests/                   60 tests
+tests/                   64 tests
 ```
 
 ### Data sources
@@ -265,7 +273,7 @@ TradingView is cheap insurance.
 ## Testing
 
 ```bash
-make test    # 60 tests
+make test    # 64 tests
 make lint
 ```
 

@@ -97,8 +97,11 @@ class DataFeed:
         days = days or int(self.cfg.data.get("history_days", 900))
 
         global_df = await self.fetch_global(spec, bars)
-        local_df = self.fetch_local(spec, days)
-        fx_df = self.fetch_local(self.cfg.fx, days)
+        # `fetch_local` is synchronous httpx. Awaiting it directly would block
+        # the event loop for seconds, which starves the Centrifugo pong
+        # handler and gets the websocket dropped for "no pong".
+        local_df = await asyncio.to_thread(self.fetch_local, spec, days)
+        fx_df = await asyncio.to_thread(self.fetch_local, self.cfg.fx, days)
 
         frame = _merge_on_global_clock(global_df, local_df, fx_df)
         return SymbolDataset(spec=spec, frame=frame)

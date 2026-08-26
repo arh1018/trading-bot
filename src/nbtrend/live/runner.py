@@ -213,7 +213,7 @@ class LiveRunner:
             )
             return
 
-        equity = self.equity_rial()
+        equity = await asyncio.to_thread(self.equity_rial)
         self.state.equity_peak_rial = max(self.state.equity_peak_rial, equity)
         drawdown = equity / self.state.equity_peak_rial - 1.0 if self.state.equity_peak_rial else 0.0
 
@@ -270,8 +270,11 @@ class LiveRunner:
         self._cap_gross(tradeable)
 
         # --- pass 3: execute ------------------------------------------------
+        # The router polls fills with a blocking `time.sleep` and can spend
+        # `repost_after_s` (45s) per attempt. Run it off the event loop so the
+        # websocket keeps answering Centrifugo's 25s ping.
         for state in tradeable:
-            self._apply_target(state, equity)
+            await asyncio.to_thread(self._apply_target, state, equity)
 
         self.state.save(self.state_path)
 
