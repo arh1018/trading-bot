@@ -62,16 +62,28 @@ class Credentials:
     api_token: str | None
     ws_auth_param: str | None
     testnet: bool
+    api_key: str | None = None
+    api_secret: str | None = None
+
+    @property
+    def uses_api_key(self) -> bool:
+        """API keys are Ed25519-signed, not bearer tokens."""
+        return bool(self.api_key and self.api_secret)
 
     @property
     def can_trade(self) -> bool:
-        return bool(self.api_token)
+        return bool(self.api_token) or self.uses_api_key
 
     def require_token(self) -> str:
+        if self.uses_api_key:
+            return self.api_key  # signed per request, not a bearer token
         if not self.api_token:
             raise RuntimeError(
-                "NOBITEX_API_TOKEN is not set. Copy .env.example to .env and fill it in; "
-                "public market data works without it, live trading does not."
+                "No Nobitex credentials. Either set NOBITEX_API_TOKEN (a login token from "
+                "POST /auth/login/), or set NOBITEX_API_KEY and NOBITEX_API_SECRET (an API "
+                "key pair from POST /apikeys/create, signed with Ed25519). An API key's "
+                "public half used as NOBITEX_API_TOKEN returns 401 -- they are different "
+                "schemes. Public market data works without either."
             )
         return self.api_token
 
@@ -151,6 +163,8 @@ def load_config(
         api_token=os.environ.get("NOBITEX_API_TOKEN") or None,
         ws_auth_param=os.environ.get("NOBITEX_WS_AUTH_PARAM") or None,
         testnet=os.environ.get("NOBITEX_TESTNET", "0") == "1",
+        api_key=os.environ.get("NOBITEX_API_KEY") or None,
+        api_secret=os.environ.get("NOBITEX_API_SECRET") or None,
     )
 
     return Config(

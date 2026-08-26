@@ -195,7 +195,8 @@ def basis(log_level: str = typer.Option("WARNING")) -> None:
     _setup_logging(log_level)
     cfg = load_config()
 
-    with NobitexREST(cfg.rest_url, cfg.creds.api_token) as api:
+    with NobitexREST(cfg.rest_url, cfg.creds.api_token,
+                    api_key=cfg.creds.api_key, api_secret=cfg.creds.api_secret) as api:
         fx_book = api.orderbook(cfg.fx.nobitex)
         console.print(
             f"[bold]USDT/IRT[/bold]  {fx_book.mid:,.0f} rial "
@@ -258,12 +259,19 @@ def doctor(log_level: str = typer.Option("WARNING")) -> None:
     console.print(f"mode           : {cfg.mode}")
     console.print(f"REST           : {cfg.rest_url}")
     console.print(f"websocket      : {cfg.ws_url}")
-    console.print(f"API token      : {'set' if cfg.creds.can_trade else '[yellow]not set[/yellow]'}")
+    if cfg.creds.uses_api_key:
+        scheme = "API key pair (Ed25519-signed)"
+    elif cfg.creds.api_token:
+        scheme = "login token (bearer)"
+    else:
+        scheme = "[yellow]none -- public data only[/yellow]"
+    console.print(f"credentials    : {scheme}")
     console.print(f"timeframe      : {cfg.data['timeframe']}")
     console.print(f"universe       : {', '.join(s.nobitex for s in cfg.enabled_symbols)}\n")
 
     try:
-        with NobitexREST(cfg.rest_url, cfg.creds.api_token) as api:
+        with NobitexREST(cfg.rest_url, cfg.creds.api_token,
+                    api_key=cfg.creds.api_key, api_secret=cfg.creds.api_secret) as api:
             book = api.orderbook("BTCIRT")
             console.print(f"[green]OK[/green] orderbook BTCIRT: {book.mid:,.0f} rial")
 
@@ -292,9 +300,24 @@ def doctor(log_level: str = typer.Option("WARNING")) -> None:
         ok = False
         console.print(f"[red]FAIL[/red] global feed: {exc}")
 
+    if cfg.creds.can_trade and not cfg.creds.uses_api_key and cfg.creds.api_token:
+        looks_like_api_key = (
+            len(cfg.creds.api_token.strip()) == 44 and cfg.creds.api_token.strip().endswith("=")
+        )
+        if looks_like_api_key:
+            console.print(
+                "\n[yellow]WARN[/yellow] NOBITEX_API_TOKEN looks like an API key "
+                "(44 chars, base64), not a login token.\n"
+                "     Nobitex API keys are NOT bearer tokens -- each request must be signed\n"
+                "     with Ed25519, which needs BOTH halves of the pair. Set NOBITEX_API_KEY\n"
+                "     (public) and NOBITEX_API_SECRET (private) instead. The private key is\n"
+                "     shown only once, when the key is created."
+            )
+
     if cfg.creds.can_trade:
         try:
-            with NobitexREST(cfg.rest_url, cfg.creds.api_token) as api:
+            with NobitexREST(cfg.rest_url, cfg.creds.api_token,
+                    api_key=cfg.creds.api_key, api_secret=cfg.creds.api_secret) as api:
                 wallets = api.wallets(["rls", "usdt", "btc"])
                 console.print(f"[green]OK[/green] wallets: {wallets}")
                 console.print(f"[green]OK[/green] ws auth param: {api.ws_auth_param()[:8]}...")

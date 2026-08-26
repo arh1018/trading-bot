@@ -93,7 +93,8 @@ class RunnerState:
 class LiveRunner:
     def __init__(self, cfg: Config, broker: Broker | None = None):
         self.cfg = cfg
-        self.rest = NobitexREST(cfg.rest_url, cfg.creds.api_token)
+        self.rest = NobitexREST(cfg.rest_url, cfg.creds.api_token,
+                    api_key=cfg.creds.api_key, api_secret=cfg.creds.api_secret)
         self.feed = DataFeed(cfg)
         self.backtester = Backtester(cfg)
 

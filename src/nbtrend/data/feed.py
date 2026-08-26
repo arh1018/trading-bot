@@ -120,7 +120,10 @@ class DataFeed:
     def fetch_local(self, spec: SymbolSpec, days: int) -> pd.DataFrame:
         end = int(time.time())
         start = end - days * 86400
-        with NobitexREST(self.cfg.rest_url, self.cfg.creds.api_token) as api:
+        with NobitexREST(
+            self.cfg.rest_url, self.cfg.creds.api_token,
+            api_key=self.cfg.creds.api_key, api_secret=self.cfg.creds.api_secret,
+        ) as api:
             df = api.candles(spec.nobitex, self.resolution, start, end)
         return self.store.append(df, "nobitex", spec.nobitex, self.resolution)
 

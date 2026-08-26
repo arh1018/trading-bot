@@ -42,13 +42,39 @@ class RateLimited(NobitexError):
 class NobitexREST:
     """Thin, typed client. Public endpoints need no token."""
 
-    def __init__(self, base_url: str, token: str | None = None, timeout: float = 20.0):
+    def __init__(
+        self,
+        base_url: str,
+        token: str | None = None,
+        timeout: float = 20.0,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+    ):
+        """Supports both Nobitex credential types.
+
+        `token` is a login token (``Authorization: Token <hex>``).
+        `api_key` + `api_secret` are an API key pair, which is signed per
+        request with Ed25519 -- see `nobitex_auth`. Passing an API key's
+        public half as `token` returns 401, because API keys are not bearer
+        tokens.
+        """
         self.base_url = base_url.rstrip("/")
         self._token = token
-        headers = {"User-Agent": "nbtrend/0.1", "Content-Type": "application/json"}
-        if token:
+        # Nobitex asks bots to identify themselves as TraderBot/<name>.
+        headers = {"User-Agent": "TraderBot/nbtrend", "Content-Type": "application/json"}
+
+        auth = None
+        if api_key and api_secret:
+            from .nobitex_auth import NobitexAPIKeyAuth
+
+            auth = NobitexAPIKeyAuth(api_key, api_secret)
+        elif token:
             headers["Authorization"] = f"Token {token}"
-        self._client = httpx.Client(base_url=self.base_url, headers=headers, timeout=timeout)
+
+        self._client = httpx.Client(
+            base_url=self.base_url, headers=headers, timeout=timeout, auth=auth
+        )
+        self._authenticated = bool(auth or token)
 
     def close(self) -> None:
         self._client.close()

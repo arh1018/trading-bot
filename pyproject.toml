@@ -19,6 +19,7 @@ dependencies = [
     "rich>=13.7",
     "pyarrow>=15.0",
     "tenacity>=8.2",
+    "cryptography>=42.0",   # Ed25519 signing for Nobitex API keys
 ]
 
 [project.optional-dependencies]
