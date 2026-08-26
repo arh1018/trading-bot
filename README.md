@@ -108,11 +108,55 @@ work and each position lands near 0.9% of equity. Check that against
 ### Going live
 
 ```bash
-cp .env.example .env      # then fill in NOBITEX_API_TOKEN
-NBTREND_MODE=live make run
+cp .env.example .env      # then fill in credentials
+NBTREND_MODE=live NBTREND_UNIVERSE=config/universe.live.yaml \
+  .venv/bin/nbtrend run --minutes 60 --interval 120
 ```
 
-`run` prompts for confirmation in live mode. Start with `NOBITEX_TESTNET=1`.
+`run` prompts for confirmation in live mode (`--yes` to skip, needed for
+non-interactive runs). Start with `NOBITEX_TESTNET=1`.
+
+#### Credentials: two schemes, easy to confuse
+
+| | Login token | API key |
+| --- | --- | --- |
+| From | `POST /auth/login/` | `POST /apikeys/create` |
+| Shape | hex string | **44 chars base64, ends `=`** |
+| Sent as | `Authorization: Token <hex>` | `Nobitex-Key` + `Nobitex-Signature` + `Nobitex-Timestamp` |
+| Env var | `NOBITEX_API_TOKEN` | `NOBITEX_API_KEY` **and** `NOBITEX_API_SECRET` |
+
+An API key is **not a bearer token** — every request carries an Ed25519
+signature over `timestamp + method + url + body`, so both halves of the pair
+are required. Using the public half as `NOBITEX_API_TOKEN` returns a bare
+`401`. The private key is shown **only once**, at creation. `nbtrend doctor`
+detects this specific mistake and says so.
+
+#### Capital decides how many symbols you can hold
+
+Nobitex rejects any IRT order under **3,000,000 rial**. Spreading equity
+across a wide universe drives every position below that, and the run places
+nothing — failing silently, one skip at a time. So the universe is the
+*opportunity set*, and `risk.max_positions` (0 = derive from equity) caps the
+*book*:
+
+```
+fundable positions = floor(equity × max_gross_exposure / min_order_rial)
+```
+
+| equity | fundable positions |
+| --- | --- |
+| 10M rial (1M toman) | 3 |
+| 100M rial | 33 |
+| 1B rial (100M toman) | 110 (the full universe) |
+
+Volatility targeting then sizes each name differently, so a kept position can
+still land under the minimum after gross capping; `_drop_unfundable` removes
+the smallest and re-spreads. The practical consequence on a small account is
+that the book concentrates in the *least volatile* signals and some capital
+stays in rial — correct behaviour, but check `risk.max_weight_per_symbol` if
+you want it deployed harder.
+
+**Add capital, not symbols, to hold more names.**
 
 ---
 
@@ -281,7 +325,7 @@ src/nbtrend/
   cli.py                 nbtrend <command>
 scripts/build_universe.py generates universe.yaml from the live market list
 scripts/shadow_test.py   full-stack dry run against real markets
-tests/                   87 tests
+tests/                   117 tests
 ```
 
 ### Data sources
@@ -301,7 +345,7 @@ TradingView is cheap insurance.
 ## Testing
 
 ```bash
-make test    # 87 tests
+make test    # 117 tests
 make lint
 ```
 
