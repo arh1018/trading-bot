@@ -500,3 +500,68 @@ def test_startup_equity_survives_an_unmarkable_holding():
 
     runner.rest = SimpleNamespace(orderbook=_boom)
     assert runner._safe_equity() == 29_125.0, "must degrade, not raise"
+
+
+def test_selection_does_not_re_announce_a_book_it_already_capped(caplog):
+    """The log flood at 25 incumbents.
+
+    Every rejected candidate restored the survivors and re-capped them, but
+    that book was already in-limit from when it was accepted, so `_cap_gross`
+    only re-emitted an identical line. Live, one cycle produced ~350 lines
+    oscillating between gross 7.491 and 7.841 -- two fixed points, alternating
+    accept/reject. The scaling itself was correct; the noise made a real cycle
+    impossible to read.
+    """
+    import copy
+    import logging
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["risk"]["max_positions"] = 0
+    cfg.raw["risk"]["max_weight_per_symbol"] = 0.35
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    runner._book = set()
+
+    # Enough names, each oversized, that the cap binds on nearly every trial.
+    states = [
+        SymbolState(spec=spec, target_weight=0.30, score=0.90 - i * 0.01)
+        for i, spec in enumerate(cfg.universe[:30])
+    ]
+
+    with caplog.at_level(logging.INFO, logger="nbtrend.live.runner"):
+        runner._limit_positions(states, equity=100_000_000)
+
+    scaling_lines = [r for r in caplog.records if "scaling every weight" in r.message]
+    assert not scaling_lines, (
+        f"the search must not narrate itself; got {len(scaling_lines)} scaling lines"
+    )
+    settled = [r for r in caplog.records if "gross exposure settled" in r.message]
+    assert len(settled) == 1, "the surviving book is summarised exactly once"
+
+
+def test_the_gross_cap_still_actually_binds():
+    """Quieting the search must not stop it capping. Same setup as above, but
+    asserting on the weights rather than the log."""
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["risk"]["max_positions"] = 0
+    cfg.raw["risk"]["max_weight_per_symbol"] = 0.35
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    runner._book = set()
+
+    states = [
+        SymbolState(spec=spec, target_weight=0.30, score=0.90 - i * 0.01)
+        for i, spec in enumerate(cfg.universe[:30])
+    ]
+    runner._limit_positions(states, equity=100_000_000)
+
+    gross = sum(abs(s.target_weight) for s in states)
+    cost_rate = float(cfg.costs["taker_fee"]) + float(cfg.costs["slippage"])
+    limit = float(cfg.risk["max_gross_exposure"]) / (1.0 + cost_rate)
+    assert gross <= limit + 1e-9, f"gross {gross:.4f} breached the {limit:.4f} cap"

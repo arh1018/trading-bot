@@ -515,7 +515,10 @@ class LiveRunner:
             trial = [*selected, candidate]
             for state in trial:
                 state.target_weight = original[id(state)]
-            self._cap_gross(trial)
+            # Quiet inside the search: each trial book is a hypothesis, not a
+            # decision, and announcing every one of them is what made a cycle
+            # unreadable. The book that survives is summarised once below.
+            self._cap_gross(trial, quiet=True)
 
             # The 3,000,000 minimum is a limit on ORDERS, not on holdings.
             # Keeping a position already in the book places no order at all, so
@@ -533,10 +536,15 @@ class LiveRunner:
                 selected = trial
             else:
                 candidate.target_weight = 0.0
-                # Restore the survivors to their last good sizing.
+                # Restore the survivors to their last good sizing. No re-cap is
+                # needed: `selected` was already capped when it was accepted,
+                # and `_cap_gross` is idempotent on an in-limit book -- calling
+                # it again only re-emitted the same scaling line. With 25
+                # incumbents that turned one cycle into ~350 log lines
+                # oscillating between two fixed points.
                 for state in selected:
                     state.target_weight = original[id(state)]
-                self._cap_gross(selected)
+                self._restore_cap(selected)
 
         chosen = {id(s) for s in selected}
         for state in wanted:
@@ -544,6 +552,12 @@ class LiveRunner:
                 state.target_weight = 0.0
 
         self._book = {s.spec.nobitex for s in selected}
+        final_gross = sum(abs(s.target_weight) for s in selected)
+        if final_gross:
+            log.info(
+                "gross exposure settled at %.3f across %d name(s)",
+                final_gross, len(selected),
+            )
         held = [s.spec.nobitex for s in selected]
         dropped = [s.spec.nobitex for s in wanted if id(s) not in chosen]
         log.info(
@@ -603,7 +617,17 @@ class LiveRunner:
             victim.target_weight = 0.0
             self._cap_gross([s for s in states if s.target_weight != 0.0])
 
-    def _cap_gross(self, states: list[SymbolState]) -> None:
+    def _restore_cap(self, states: list[SymbolState]) -> None:
+        """Re-apply the gross cap without logging.
+
+        Used on the rejection path of the selection search, where the book
+        being restored was already capped when it was accepted. The scaling is
+        real but says nothing new, and at 25+ incumbents re-announcing it once
+        per rejected candidate buried the cycle in identical lines.
+        """
+        self._cap_gross(states, quiet=True)
+
+    def _cap_gross(self, states: list[SymbolState], quiet: bool = False) -> None:
         """Scale target weights down so the book respects max_gross_exposure.
 
         The cap is reduced by a cost allowance first. Fees are charged on top
@@ -620,7 +644,8 @@ class LiveRunner:
             return
 
         factor = max_gross / gross
-        log.info(
+        log.log(
+            logging.DEBUG if quiet else logging.INFO,
             "gross exposure %.3f exceeds the %.3f cost-adjusted limit; "
             "scaling every weight by %.4f",
             gross, max_gross, factor,
