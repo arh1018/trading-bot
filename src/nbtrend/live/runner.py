@@ -449,6 +449,23 @@ class LiveRunner:
         for state in tradeable:
             await asyncio.to_thread(self._apply_target, state, equity)
 
+        # Incumbency must reflect what we actually HOLD, not what we chose.
+        # Selection runs in pass 2 and execution in pass 4, and most selected
+        # names never get bought -- their order lands under the exchange
+        # minimum and is skipped. Recording intent meant a name bought on the
+        # last of the cash was not an incumbent next cycle, so it was re-judged
+        # as a fresh candidate and sold straight back: live, BCH was bought at
+        # 544,754,000 and sold at 543,255,000 one cycle later, paying a round
+        # trip for nothing. Re-reading holdings costs one balances call, which
+        # the broker caches anyway.
+        try:
+            self._book = await asyncio.to_thread(self._held_symbols)
+        except Exception:
+            # Keep the previous book rather than dropping to empty: an empty
+            # book means nothing is an incumbent, which is exactly the churn
+            # this guards against.
+            log.debug("could not refresh incumbency from holdings", exc_info=True)
+
         self.state.save(self.state_path)
 
     def _limit_positions(self, states: list[SymbolState], equity: float) -> list[SymbolState]:
@@ -551,7 +568,6 @@ class LiveRunner:
             if id(state) not in chosen:
                 state.target_weight = 0.0
 
-        self._book = {s.spec.nobitex for s in selected}
         final_gross = sum(abs(s.target_weight) for s in selected)
         if final_gross:
             log.info(

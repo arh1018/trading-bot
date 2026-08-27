@@ -565,3 +565,39 @@ def test_the_gross_cap_still_actually_binds():
     cost_rate = float(cfg.costs["taker_fee"]) + float(cfg.costs["slippage"])
     limit = float(cfg.risk["max_gross_exposure"]) / (1.0 + cost_rate)
     assert gross <= limit + 1e-9, f"gross {gross:.4f} breached the {limit:.4f} cap"
+
+
+def test_incumbency_tracks_holdings_not_intent(monkeypatch):
+    """The BCH round trip.
+
+    Selection (pass 2) recorded `_book` from the names it CHOSE, but execution
+    is pass 4 and most chosen names are never bought -- their order lands under
+    the exchange minimum and is skipped. A name bought on the last of the cash
+    was therefore not an incumbent on the next cycle, got re-judged as a fresh
+    candidate, and was sold straight back. Live: BCH bought at 544,754,000 and
+    sold at 543,255,000 one cycle later, paying a full round trip for nothing.
+
+    `_limit_positions` must leave `_book` alone; only observed holdings set it.
+    """
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["risk"]["max_positions"] = 2
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    before = {"ALREADY_HELD"}
+    runner._book = before
+
+    states = [
+        SymbolState(spec=cfg.universe[0], target_weight=0.3, score=0.90),
+        SymbolState(spec=cfg.universe[1], target_weight=0.3, score=0.88),
+    ]
+    runner._limit_positions(states, equity=100_000_000)
+
+    assert runner._book is before, (
+        "selection must not overwrite incumbency with names it merely intends "
+        "to buy; holdings are the only source of truth"
+    )
