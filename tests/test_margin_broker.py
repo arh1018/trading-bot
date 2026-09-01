@@ -399,10 +399,15 @@ def test_equity_includes_margin_wallet_and_open_positions():
     runner = object.__new__(LiveRunner)
     runner.cfg = load_config()
     runner.fx_state = SimpleNamespace(book=None)
-    runner.rest = SimpleNamespace(margin_wallets=lambda: {"rls": 6_558_554.0})
 
     pos = SimpleNamespace(collateral=2_000_000.0, unrealized_pnl=-150_000.0)
-    runner.margin = SimpleNamespace(positions=lambda: [pos])
+    # Free collateral comes through the broker's CACHED read -- an uncached
+    # /users/wallets/list here every cycle earned a 429 that aborted the whole
+    # rebalance, on an endpoint shared with the spot balance reads.
+    runner.margin = SimpleNamespace(
+        collateral=lambda: 6_558_554.0,
+        positions=lambda: [pos],
+    )
 
     # free collateral + posted collateral + unrealised PNL
     assert runner._margin_equity() == pytest.approx(6_558_554.0 + 2_000_000.0 - 150_000.0)
@@ -428,8 +433,7 @@ def test_margin_equity_degrades_instead_of_raising():
     runner = object.__new__(LiveRunner)
     runner.cfg = load_config()
     runner.fx_state = SimpleNamespace(book=None)
-    runner.rest = SimpleNamespace(margin_wallets=boom)
-    runner.margin = SimpleNamespace(positions=boom)
+    runner.margin = SimpleNamespace(collateral=boom, positions=boom)
     assert runner._margin_equity() == 0.0
 
 
@@ -499,7 +503,23 @@ def test_cancel_prefers_client_order_id_over_the_numeric_id():
 
     rest.cancel_order(order_id=6060811294, client_order_id="mgnabc")
     assert sent.get("clientOrderId") == "mgnabc"
-    assert "id" not in sent, "the numeric id must not be sent when a coid exists"
+    assert "order" not in sent, "the numeric id must not be sent when a coid exists"
+
+
+def test_cancel_uses_the_order_field_when_there_is_no_client_order_id():
+    """update-status takes `order`, not `id` -- they are different endpoints
+    with different field names, and position CLOSE orders carry no
+    clientOrderId, so the numeric id is the only handle they have. With the
+    wrong field name four stale close orders were uncancellable."""
+    from nbtrend.data.nobitex_rest import NobitexREST
+
+    sent = {}
+    rest = object.__new__(NobitexREST)
+    rest._post = lambda path, payload: sent.update(payload) or {"status": "ok"}
+
+    rest.cancel_order(order_id=6069755943)
+    assert sent.get("order") == 6069755943
+    assert "id" not in sent, "update-status ignores `id`; it reads `order`"
 
 
 # -- short concentration ----------------------------------------------------

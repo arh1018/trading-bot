@@ -336,11 +336,21 @@ class NobitexREST:
         # -- it returns `"id": null` and a display name ("Aptos") rather than a
         # currency code -- so the id is often not even knowable. Every order
         # this bot places carries a clientOrderId for exactly this reason.
+        # The numeric id field here is `order`, NOT `id`. These two endpoints
+        # genuinely disagree: `/market/orders/status` takes `id` (verified
+        # live), while `/market/orders/update-status` takes `order`. Sending
+        # `id` to update-status returns "Both id and clientOrderId cannot be
+        # null" -- the server simply does not read it.
+        #
+        # This matters because position CLOSE orders carry no clientOrderId:
+        # Nobitex does not propagate ours onto them, so the numeric id is the
+        # only handle, and with the wrong field name they were uncancellable.
+        # Four stale close orders sat unfilled in the book because of it.
         payload: dict[str, Any] = {"status": "canceled"}
         if client_order_id is not None:
             payload["clientOrderId"] = client_order_id
         elif order_id is not None:
-            payload["id"] = order_id
+            payload["order"] = order_id
         return self._post("/market/orders/update-status", payload).get("status") == "ok"
 
     def open_orders(self, src: str | None = None, dst: str | None = None) -> list[Order]:
