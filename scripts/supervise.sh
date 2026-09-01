@@ -29,7 +29,7 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   started=$(date +%s)
   NBTREND_UNIVERSE=${NBTREND_UNIVERSE:-config/universe.live.yaml} \
     .venv/bin/python -m nbtrend.cli run \
-      --yes --minutes "$remaining_min" --interval "${INTERVAL:-120}" \
+      --yes --minutes "$remaining_min" --interval "${INTERVAL:-60}" \
       >> "$LOG_DIR/live.log" 2>&1
   code=$?
   ran=$(( $(date +%s) - started ))

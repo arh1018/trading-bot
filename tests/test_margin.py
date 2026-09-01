@@ -221,8 +221,15 @@ def test_borrow_fee_is_prorated_from_a_daily_rate():
     bt = Backtester(cfg)
     bars_per_day = max(1.0, bt.periods_per_year / 365.0)
     per_bar = 0.0005 / bars_per_day
-    assert bars_per_day == pytest.approx(6.0, rel=0.05), "240m timeframe is 6 bars/day"
-    assert per_bar == pytest.approx(0.0005 / 6, rel=1e-6)
+
+    # Derived from the configured timeframe, not pinned to one: the timeframe
+    # is a tuning decision (it moved 240 -> 720 on cost evidence) and a test
+    # that hardcodes it fails for the wrong reason. What must hold is the
+    # RELATIONSHIP -- a daily rate spread across a day's worth of bars.
+    expected_bars_per_day = 24.0 / (int(cfg.data["timeframe"]) / 60.0)
+    assert bars_per_day == pytest.approx(expected_bars_per_day, rel=0.05)
+    assert per_bar == pytest.approx(0.0005 / expected_bars_per_day, rel=1e-3)
+    assert per_bar < 0.0005, "a single bar must cost less than a whole day"
 
 
 def test_financing_is_only_charged_on_the_borrowed_portion():

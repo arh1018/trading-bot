@@ -66,7 +66,9 @@ class MarginBroker:
         self._markets: dict[str, object] | None = None
         self._collateral = 0.0
         self._collateral_at = 0.0
-        self._collateral_ttl = 10.0
+        # Shares the rate-limited /users/wallets/list budget with spot
+        # balance reads, so this is cached for a whole cycle, not seconds.
+        self._collateral_ttl = 30.0
 
     # -- capability --------------------------------------------------------
     def markets(self, refresh: bool = False) -> dict[str, object]:

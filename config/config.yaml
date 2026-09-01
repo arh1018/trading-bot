@@ -5,7 +5,17 @@
 data:
   # Bar size the strategy runs on. Trading costs on Nobitex (see `costs`)
   # are ~0.5% round trip, so sub-hourly trend following is not viable.
-  timeframe: "240"            # Nobitex/TV resolution: 60,180,240,360,720,D
+  # 240 -> 720. Measured across 6 symbols with the REAL 62bps median spread
+  # (not the 10bps the model assumed):
+  #     4h : Sharpe 1.04, +38.9%, 48 trades, costs 16.9% of equity
+  #     12h: Sharpe 0.95, +32.1%, 15 trades, costs  5.0%
+  #     D  : Sharpe 0.86, +31.1%,  5 trades, costs  1.9%
+  # 4h wins on point estimate, but spends 16.9% of equity to earn 38.9% -- and
+  # that uses the MEDIAN spread, while the book holds thin alts where spreads
+  # are far wider. 12h keeps most of the return with a third of the cost
+  # exposure, so it survives the cost assumption being wrong. That assumption
+  # is the one least worth trusting.
+  timeframe: "720"            # Nobitex/TV resolution: 60,180,240,360,720,D
   warmup_bars: 400            # bars of history needed before the first signal
   history_days: 900           # how far back `nbtrend fetch` pulls
   cache_dir: "data/candles"
@@ -96,7 +106,7 @@ strategy:
   # improved, mean Sharpe -0.79 (scripts/short_study.py). Rial-denominated
   # crypto drifts upward with rial devaluation, so a short book fights the
   # carry while paying ~147bps a round trip.
-  allow_short: true
+  allow_short: false
 
 # ---------------------------------------------------------------------------
 risk:
@@ -125,6 +135,11 @@ risk:
 # liquidation is permanent -- the collateral is seized and does not come back
 # when the price does.
 margin:
+  # DISABLED on evidence. Measured: shorts improved 0 of 8 symbols, mean Sharpe
+  # delta -0.79 -- rial-denominated crypto drifts UP with rial devaluation, so
+  # a short book is a leveraged bet against the one force reliably paying here.
+  # Live confirmation: the sleeve reached -437,212 unrealized before it was
+  # closed, while the spot book carried the account.
   enabled: false             # master switch; nothing below applies while false
 
   # Collateral lives in a SEPARATE wallet and must be moved there first
@@ -196,7 +211,11 @@ execution:
   # bar; without a band the book rebalances continuously and pays ~0.4% each
   # time for a position change too small to matter. Only trade when the gap
   # between current and target weight exceeds this fraction of equity.
-  min_rebalance_weight: 0.05
+  # Lowered 0.05 -> 0.035 to raise turnover, but no lower: a trade must still
+  # clear min_order_rial (3,000,000), which on a ~90M book is 0.033 of equity.
+  # A band under that lets through adjustments the exchange simply rejects --
+  # turnover on paper, skipped orders in practice.
+  min_rebalance_weight: 0.035
 
   # Rial held back from the strategy entirely. Sizing runs on
   # (equity - cash_reserve_rial), and buys are clamped against it, so this
@@ -210,7 +229,11 @@ execution:
   # (0.22% fees plus the spread, measured at a 62bp median outside the majors).
   # A name already in the book keeps its slot unless a challenger's score beats
   # it by this margin. Scores are roughly -1..+1, so 0.10 is a real gap.
-  incumbent_score_bonus: 0.10
+  # Lowered 0.10 -> 0.05 to rotate more readily. This is the anti-churn brake:
+  # at 0 the last slot flips on noise and pays a full round trip (~147bps all
+  # in) each time, which is what it was added to stop. 0.05 still requires a
+  # visible edge to evict an incumbent.
+  incumbent_score_bonus: 0.05
 
   # Nobitex credits a wallet ~2s AFTER the fill is acknowledged. Reading
   # balances inside that window returns pre-trade numbers, which makes the
@@ -221,7 +244,12 @@ execution:
   # earns a 429 from /users/wallets/list and loses the whole cycle. Every
   # order submission and settlement invalidates the cache, so it cannot hide
   # a fill.
-  balance_ttl_s: 3.0
+  # Raised 3.0 -> 10.0 for 60s cycles. A shorter interval multiplies wallet
+  # reads against a per-IP rate limit that is SHARED with margin reads; a 429
+  # here aborts the entire rebalance, so the cache is what keeps short cycles
+  # viable. Every submission and settlement still invalidates it, so it cannot
+  # hide a fill.
+  balance_ttl_s: 10.0
 
   settlement_poll_s: 0.5      # how often to re-read wallets while confirming
   settlement_timeout_s: 20    # give up confirming after this long
