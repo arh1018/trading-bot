@@ -24,6 +24,7 @@ import pandas as pd
 
 from ..config import Config, SymbolSpec
 from .binance import BinanceFeed
+from .kucoin import KuCoinFeed
 from .nobitex_rest import NobitexREST
 from .store import CandleStore
 from .tradingview import TradingViewFeed
@@ -99,7 +100,9 @@ class DataFeed:
         if not spec.tradingview:
             raise ValueError(f"{spec.nobitex} has no `tradingview` symbol in universe.yaml")
 
-        if self._source == "binance" or self._tv_disabled:
+        if self._source == "kucoin":
+            df = await KuCoinFeed().fetch_ohlcv(spec.tradingview, self.resolution, bars)
+        elif self._source == "binance" or self._tv_disabled:
             df = await BinanceFeed().fetch_ohlcv(spec.tradingview, self.resolution, bars)
         else:
             tv = self.cfg.data["tradingview"]
