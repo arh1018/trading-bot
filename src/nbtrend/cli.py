@@ -342,5 +342,51 @@ def doctor(log_level: str = typer.Option("WARNING")) -> None:
     console.print(f"\n{'[green]all checks passed[/green]' if ok else '[red]some checks failed[/red]'}")
 
 
+@app.command()
+def margin(log_level: str = typer.Option("WARNING")) -> None:
+    """Report margin capability, wallet and open positions. Places NO orders."""
+    _setup_logging(log_level)
+    cfg = load_config()
+
+    with NobitexREST(cfg.rest_url, cfg.creds.api_token,
+                api_key=cfg.creds.api_key, api_secret=cfg.creds.api_secret) as api:
+        markets = api.margin_markets()
+        universe = {s.nobitex for s in cfg.enabled_symbols}
+        tradeable = {k: v for k, v in markets.items() if k in universe}
+        shortable = [k for k, v in tradeable.items() if v.sell_enabled]
+
+        console.print(f"margin markets       : {len(markets)} total")
+        console.print(f"  in our universe    : {len(tradeable)}")
+        console.print(f"  shortable          : {len(shortable)}")
+        if tradeable:
+            lev = max(v.max_leverage for v in tradeable.values())
+            fee = max(v.position_fee_rate for v in tradeable.values())
+            console.print(f"  max leverage       : {lev:g}x")
+            console.print(f"  position fee rate  : {fee:.4%}")
+
+        wallets = api.wallets()
+        console.print(f"\nspot rial            : {wallets.get('rls', 0.0):,.0f}")
+
+        positions = api.positions(status="active")
+        if not positions:
+            console.print("open positions       : none")
+            return
+
+        table = Table(title="open margin positions")
+        for col in ("id", "symbol", "side", "lev", "collateral", "liq price",
+                    "to liq", "unreal PNL"):
+            table.add_column(col)
+        for p in positions:
+            room = p.distance_to_liquidation()
+            table.add_row(
+                str(p.id), p.symbol, p.side.name, f"{p.leverage:g}x",
+                f"{p.collateral:,.0f}",
+                f"{p.liquidation_price:,.0f}" if p.liquidation_price else "-",
+                f"{room:+.1%}" if room is not None else "-",
+                f"{p.unrealized_pnl:,.0f}",
+            )
+        console.print(table)
+
+
 if __name__ == "__main__":
     app()

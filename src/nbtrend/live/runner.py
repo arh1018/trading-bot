@@ -152,6 +152,10 @@ class LiveRunner:
     # Class-level default so selection works on a partially built runner
     # (the risk tests exercise _limit_positions without a full __init__).
     _book: set[str] = set()
+    margin = None
+    _short_warned = False
+    _short_notional_used = 0.0
+    _pending_shorts: dict[str, str] = {}
 
     def __init__(self, cfg: Config, broker: Broker | None = None):
         self.cfg = cfg
@@ -168,6 +172,13 @@ class LiveRunner:
         self.fx_state = SymbolState(spec=cfg.fx)
 
         self.broker = broker or self._build_broker()
+        # Margin is opt-in and stays None unless explicitly enabled, so a
+        # short signal has nothing to execute against and gets flattened.
+        self._short_warned = False
+        self._short_notional_used = 0.0
+        # symbol -> clientOrderId of a short order still working.
+        self._pending_shorts: dict[str, str] = {}
+        self.margin = self._build_margin_broker()
         self.router = OrderRouter(
             self.broker, cfg.execution, float(cfg.costs["min_order_rial"])
         )
@@ -303,6 +314,13 @@ class LiveRunner:
         self._lock.acquire()
 
         try:
+            # In-flight short tracking is in memory, so a restart forgets what
+            # is resting in the book and would open duplicates on top of it.
+            # Clear it once, up front; anything still wanted is re-opened at
+            # the current price on the first cycle.
+            if self.margin is not None:
+                await asyncio.to_thread(self.margin.cancel_working_orders)
+
             await self._await_books(timeout_s=45)
             while not self._stop.is_set():
                 try:
@@ -404,6 +422,20 @@ class LiveRunner:
             state.score = float(last["score"])
             state.target_weight = 0.0 if self.state.halted else float(last["target_weight"])
 
+            # A negative weight means SHORT, which spot cannot express: the
+            # runner sizes positions as wallet balances, so a negative target
+            # would try to sell more than is held. Shorts require margin, so
+            # unless margin is enabled AND this market allows selling, a short
+            # signal is flattened to cash rather than acted on.
+            if state.target_weight < 0 and not self._can_short(symbol):
+                if not self._short_warned:
+                    log.warning(
+                        "shorts are signalled but margin is off (or the market "
+                        "forbids selling); treating every short as flat"
+                    )
+                    self._short_warned = True
+                state.target_weight = 0.0
+
             if not state.tradeable:
                 log.warning("%s: not tradeable (closed or no book)", symbol)
                 state.target_weight = 0.0
@@ -432,22 +464,32 @@ class LiveRunner:
 
             tradeable.append(state)
 
+        # Cash held back from the strategy. Sizing runs on INVESTABLE equity,
+        # not total equity: if the reserve stayed in the number the book would
+        # target gross 1.0 of everything and spend the reserve on the next dip.
+        # `equity` itself is left intact so the drawdown stop and the equity
+        # peak still measure the real account.
+        investable = max(0.0, equity - self._cash_reserve())
+        # Short budget is per-cycle; reset before any target is applied.
+        self._short_notional_used = 0.0
+        self._reconcile_pending_shorts()
+
         # --- pass 2: keep only as many positions as equity can fund ---------
-        tradeable = self._limit_positions(tradeable, equity)
+        tradeable = self._limit_positions(tradeable, investable)
 
         # Gross exposure was already capped inside the selection search above:
         # it evaluates each candidate book *after* capping, which is the only
         # way to know whether a position clears the exchange minimum.
 
         # --- pass 3b: drop anything the gross cap pushed under the minimum ---
-        self._drop_unfundable(tradeable, equity)
+        self._drop_unfundable(tradeable, investable)
 
         # --- pass 4: execute ------------------------------------------------
         # The router polls fills with a blocking `time.sleep` and can spend
         # `repost_after_s` (45s) per attempt. Run it off the event loop so the
         # websocket keeps answering Centrifugo's 25s ping.
         for state in tradeable:
-            await asyncio.to_thread(self._apply_target, state, equity)
+            await asyncio.to_thread(self._apply_target, state, investable)
 
         # Incumbency must reflect what we actually HOLD, not what we chose.
         # Selection runs in pass 2 and execution in pass 4, and most selected
@@ -674,6 +716,20 @@ class LiveRunner:
         assert state.book is not None
         price = state.book.mid
 
+        # A short is a MARGIN position, not a negative wallet balance, so it
+        # cannot go through the spot path below -- that path clamps every sell
+        # to what is held (`min(delta_amount, held)`) and would silently turn
+        # a short signal into "go flat".
+        if self.margin is not None:
+            existing_short = self._open_short(spec.nobitex)
+            if state.target_weight < 0:
+                self._apply_short_target(state, equity, existing_short)
+                return
+            if existing_short is not None:
+                # Signal has turned non-negative: close the short before the
+                # spot path considers buying.
+                self._close_short(existing_short, price)
+
         base, _ = _split_symbol(spec.nobitex)
         # One snapshot for the whole decision: holding, spendable cash and the
         # settlement baseline all come from it. Re-reading per use is what
@@ -702,7 +758,11 @@ class LiveRunner:
             # alongside the cost-adjusted gross cap: rounding, slippage and a
             # moving book can still push the last order of a cycle over.
             cost_rate = float(self.cfg.costs["taker_fee"]) + float(self.cfg.costs["slippage"])
-            cash = balances.get("rls", 0.0)
+            # Spendable cash excludes the reserve. Sizing already works on
+            # investable equity, but rounding and a moving book can still push
+            # the last order of a cycle over -- and the whole point of the
+            # reserve is that it is there when it is wanted.
+            cash = max(0.0, balances.get("rls", 0.0) - self._cash_reserve())
             affordable = max(0.0, cash / (price * (1.0 + cost_rate)))
             if affordable < delta_amount:
                 log.info(
@@ -751,7 +811,259 @@ class LiveRunner:
         usdt = balances.get("usdt", 0.0)
         if usdt and self.fx_state.book:
             total += usdt * self.fx_state.book.mid
+
+        # The MARGIN wallet is a separate balance that `balances()` does not
+        # see. Moving 6,558,554 rial into it read as an instant -8% loss:
+        # sizing shrank and the drawdown stop started measuring against a peak
+        # that included money the account still had. Open positions count too,
+        # as posted collateral plus unrealised PNL -- that collateral is locked
+        # out of the wallet's free balance, so it would otherwise vanish twice.
+        total += self._margin_equity()
         return total
+
+    def _margin_equity(self) -> float:
+        """Collateral in the margin wallet plus the value of open positions.
+
+        Never raises: an unreadable margin wallet degrades to "spot only",
+        which understates equity but keeps the loop alive.
+        """
+        if self.margin is None:
+            return 0.0
+        total = 0.0
+        try:
+            free = self.rest.margin_wallets()
+            total += float(free.get("rls", 0.0))
+            usdt = float(free.get("usdt", 0.0))
+            if usdt and self.fx_state.book:
+                total += usdt * self.fx_state.book.mid
+        except Exception:
+            log.debug("could not read the margin wallet for equity", exc_info=True)
+        try:
+            for p in self.margin.positions():
+                total += float(p.collateral) + float(p.unrealized_pnl)
+        except Exception:
+            log.debug("could not read positions for equity", exc_info=True)
+        return total
+
+    COLLATERAL_SAFETY = 0.80
+    """Use at most this share of margin collateral, so the last short is not
+    opened at exactly 100% of margin where any adverse tick is a margin call."""
+
+    def _short_budget(self, equity: float, leverage: float) -> float:
+        """Maximum total short NOTIONAL allowed right now."""
+        margin_cfg = self.cfg.raw.get("margin", {})
+        strategy_cap = float(margin_cfg.get("max_short_gross", 0.0) or 0.0) * equity
+        try:
+            collateral = self.margin.collateral() if self.margin else 0.0
+        except Exception:
+            collateral = 0.0
+        exchange_cap = collateral * max(1.0, leverage) * self.COLLATERAL_SAFETY
+        if strategy_cap <= 0:
+            return exchange_cap
+        return min(strategy_cap, exchange_cap)
+
+    def _cash_reserve(self) -> float:
+        """Rial deliberately kept out of the strategy's hands.
+
+        Used to park cash the operator needs for something else -- funding the
+        margin wallet, for instance, which cannot be done from the API while
+        the key lacks the transfer scope. Without this the bot redeploys idle
+        rial into spot positions on the next cycle and the money is never there
+        when it is wanted.
+        """
+        return float(self.cfg.execution.get("cash_reserve_rial", 0.0) or 0.0)
+
+    def _reconcile_pending_shorts(self) -> None:
+        """Drop tracked short orders that are no longer working.
+
+        An order leaves this set when it fills, is cancelled, or cannot be
+        found. Anything still Active blocks a second order on that symbol,
+        which is what stops the book stacking duplicates while a limit rests.
+        """
+        if not self._pending_shorts:
+            return
+        for symbol, coid in list(self._pending_shorts.items()):
+            try:
+                order = self.rest.order_status(client_order_id=coid)
+            except Exception:
+                # Unknown state: forget it rather than blocking the symbol
+                # forever. A duplicate is caught next cycle by position_for.
+                log.debug("could not read short order %s for %s", coid, symbol, exc_info=True)
+                self._pending_shorts.pop(symbol, None)
+                continue
+            if str(order.status.value).lower() not in ("new", "active", "partial"):
+                self._pending_shorts.pop(symbol, None)
+
+    def _open_short(self, symbol: str):
+        """The open short position for this symbol, if any. Never raises."""
+        if self.margin is None:
+            return None
+        try:
+            p = self.margin.position_for(symbol)
+        except Exception:
+            log.warning("could not read positions for %s", symbol, exc_info=True)
+            return None
+        from ..core.types import PositionSide
+
+        return p if p is not None and p.side is PositionSide.SHORT else None
+
+    def _close_short(self, position, price: float | None) -> None:
+        try:
+            self.margin.close_position(position, price=price)
+        except Exception:
+            log.exception("could not close short %s on %s", position.id, position.symbol)
+
+    def _apply_short_target(self, state: SymbolState, equity: float, existing) -> None:
+        """Open, resize or close a short so it matches `target_weight`.
+
+        Sizing note: `target_weight` is a fraction of EQUITY, and that is the
+        exposure we want -- the leverage only decides how much collateral is
+        posted against it. Multiplying the exposure by leverage as well would
+        take a 5x setting to 5x the intended risk.
+        """
+        spec = state.spec
+        symbol = spec.nobitex
+        price = state.book.mid
+        min_order = float(self.cfg.costs["min_order_rial"])
+        margin_cfg = self.cfg.raw.get("margin", {})
+        leverage = float(margin_cfg.get("max_leverage", 1.0))
+
+        # Size multiplier for shorts. Vol targeting spreads the book thinly
+        # across every signal, which left each short at ~3.7M notional -- barely
+        # over the 3,000,000 exchange minimum, so fees and spread ate a large
+        # share of any move. Scaling here concentrates the SAME short budget
+        # into fewer, larger positions rather than adding exposure: the budget
+        # ceilings below still bind, so this cannot raise total short risk
+        # above `max_short_gross` or what the collateral supports.
+        size_multiplier = float(margin_cfg.get("short_size_multiplier", 1.0) or 1.0)
+        wanted_notional = abs(state.target_weight) * equity * max(1.0, size_multiplier)
+
+        # Two independent ceilings on the short book, whichever binds first.
+        #
+        #   * `max_short_gross` -- a strategy limit, as a fraction of equity.
+        #   * collateral x leverage -- a hard exchange limit. Position size is
+        #     computed from total equity (~88M) while collateral is a small
+        #     separate wallet (~6.5M), so without this the book cheerfully
+        #     sizes shorts it cannot post margin for and every one comes back
+        #     InsufficientBalance, burning the shared 300-per-10-minutes order
+        #     budget and blocking SPOT trading with it.
+        #
+        # A safety factor keeps the last position from sitting at exactly 100%
+        # of collateral, where any adverse tick is an immediate margin call.
+        budget = self._short_budget(equity, leverage)
+        remaining = max(0.0, budget - self._short_notional_used)
+        if wanted_notional > remaining:
+            if remaining < min_order:
+                log.info(
+                    "%s: short budget exhausted (%s of %s rial used); skipping",
+                    symbol, f"{self._short_notional_used:,.0f}", f"{budget:,.0f}",
+                )
+                return
+            log.info(
+                "%s: trimming short %s -> %s rial to fit the budget",
+                symbol, f"{wanted_notional:,.0f}", f"{remaining:,.0f}",
+            )
+            wanted_notional = remaining
+
+        if wanted_notional < min_order:
+            if existing is not None:
+                log.info("%s: short target below the minimum; closing", symbol)
+                self._close_short(existing, price)
+            return
+
+        if existing is not None:
+            # Liquidation proximity is checked every cycle: it happens at the
+            # exchange between our decisions, so the drawdown stop never sees it.
+            if self.margin.at_risk(existing, price):
+                log.error(
+                    "%s: short %s is within %.0f%% of liquidation -- closing",
+                    symbol, existing.id, self.margin.min_liquidation_distance * 100,
+                )
+                self._close_short(existing, price)
+                return
+
+            held_notional = abs(existing.liability) * price
+            gap = (wanted_notional - held_notional) / equity if equity else 0.0
+            if abs(gap) < float(self.cfg.execution.get("min_rebalance_weight", 0.0)):
+                return
+            if gap < 0:
+                units = round_to_step(abs(gap) * equity / price, spec.amount_step)
+                if units * price >= min_order:
+                    log.info("%s: trimming short by %.8f", symbol, units)
+                    try:
+                        self.margin.close_position(existing, amount=units, price=price)
+                    except Exception:
+                        log.exception("could not trim short on %s", symbol)
+            return
+
+        units = round_to_step(wanted_notional / price, spec.amount_step)
+        if units <= 0 or units * price < min_order:
+            return
+
+        # A margin order that has not filled yet is NOT a position, so
+        # `position_for` cannot see it. Opening again on the next cycle stacked
+        # three APTIRT and three FILIRT sells in six minutes -- 3x the intended
+        # short exposure the moment they filled. Track what is in flight by the
+        # clientOrderId we generate, since the order list returns `"id": null`
+        # and a display name rather than a symbol.
+        if symbol in self._pending_shorts:
+            log.info("%s: a short order is already working; not stacking another", symbol)
+            return
+
+        log.info(
+            "%s: score %+.2f | weight %.3f | OPEN SHORT %.8f at %gx",
+            symbol, state.score, state.target_weight, units, leverage,
+        )
+        try:
+            order = self.margin.open_position(
+                symbol, Side.SELL, units, price=price, leverage=leverage
+            )
+            self._short_notional_used += units * price
+            if order.client_order_id:
+                self._pending_shorts[symbol] = order.client_order_id
+        except Exception:
+            log.exception("could not open short on %s", symbol)
+
+    def _build_margin_broker(self):
+        """Only in live mode, only when explicitly enabled, never in paper."""
+        margin_cfg = self.cfg.raw.get("margin", {})
+        if not margin_cfg.get("enabled") or not self.cfg.is_live:
+            return None
+
+        from ..execution.margin import MarginBroker
+
+        specs = {s.nobitex: s for s in [*self.cfg.enabled_symbols, self.cfg.fx]}
+        log.warning(
+            "MARGIN ENABLED -- leverage up to %gx. Positions can be LIQUIDATED "
+            "between cycles; that loss is permanent.",
+            float(margin_cfg.get("max_leverage", 1.0)),
+        )
+        return MarginBroker(
+            self.rest,
+            specs,
+            max_leverage=float(margin_cfg.get("max_leverage", 1.0)),
+            min_liquidation_distance=float(margin_cfg.get("min_liquidation_distance", 0.15)),
+        )
+
+    def _can_short(self, symbol: str) -> bool:
+        """Shorting needs margin enabled AND a market that permits selling.
+
+        Deliberately fails closed: any error reading margin capability means
+        no short, because the failure mode of guessing wrong is a spot sell
+        order for units the account does not own.
+        """
+        if self.margin is None:
+            return False
+        try:
+            # Require collateral for a whole minimum order, or the short is
+            # rejected `InsufficientBalance` and wastes a slot in the
+            # 300-per-10-minutes budget -- ~50 times a cycle.
+            return self.margin.can_short(
+                symbol, min_collateral=float(self.cfg.costs["min_order_rial"])
+            )
+        except Exception:
+            log.debug("could not read margin capability for %s", symbol, exc_info=True)
+            return False
 
     def _held_symbols(self) -> set[str]:
         """Symbols we actually own, for incumbency.

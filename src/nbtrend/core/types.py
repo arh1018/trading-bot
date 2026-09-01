@@ -120,3 +120,75 @@ class Fill:
     fee: float
     ts: int
     order_id: int | None = None
+
+
+class PositionSide(str, Enum):
+    """Direction of a margin position.
+
+    Nobitex opens a position from the order `type`: a `sell` order opens a
+    SHORT (you borrow the asset and owe it back), a `buy` order opens a LONG.
+    """
+
+    LONG = "buy"
+    SHORT = "sell"
+
+
+@dataclass(slots=True)
+class MarginMarket:
+    """One entry of `GET /margin/markets/list`."""
+
+    symbol: str
+    src: str
+    dst: str
+    max_leverage: float
+    sell_enabled: bool
+    buy_enabled: bool
+    position_fee_rate: float
+
+
+@dataclass(slots=True)
+class MarginPosition:
+    """An open margin position.
+
+    Unlike a spot holding, this is a distinct exchange object with its own
+    collateral and a `liquidation_price`. Losses are NOT bounded by the
+    position size: if the mark crosses liquidation the collateral is seized.
+    That is the whole reason the live runner cannot treat a position as if it
+    were a wallet balance.
+
+    All monetary fields are RIAL for dst=rls markets.
+    """
+
+    id: int
+    symbol: str
+    side: PositionSide
+    status: str
+    collateral: float
+    leverage: float
+    liquidation_price: float | None
+    entry_price: float | None
+    liability: float
+    delegated_amount: float
+    margin_ratio: float | None
+    unrealized_pnl: float
+    mark_price: float | None = None
+    expiration_date: str | None = None
+    extension_fee: float = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        return self.status.lower() in ("open", "active")
+
+    def distance_to_liquidation(self, price: float | None = None) -> float | None:
+        """Fraction the mark can move against the position before liquidation.
+
+        Returns None when the exchange has not published a liquidation price
+        (it does not for an unleveraged position). A SHORT is liquidated by the
+        price rising, a LONG by it falling, so the sign is handled per side.
+        """
+        mark = price if price is not None else self.mark_price
+        if not mark or not self.liquidation_price:
+            return None
+        if self.side is PositionSide.SHORT:
+            return (self.liquidation_price - mark) / mark
+        return (mark - self.liquidation_price) / mark

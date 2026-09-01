@@ -91,9 +91,12 @@ strategy:
     entry: 0.30
     exit: 0.10
 
-  # Spot IRT markets cannot be sold short, so the default book is long/flat.
-  # Set to true only if you have enabled Nobitex margin trading.
-  allow_short: false
+  # Spot IRT markets cannot be sold short, so a short requires MARGIN (see the
+  # `margin` block). Measured cost of enabling this: across 8 symbols, 0 of 8
+  # improved, mean Sharpe -0.79 (scripts/short_study.py). Rial-denominated
+  # crypto drifts upward with rial devaluation, so a short book fights the
+  # carry while paying ~147bps a round trip.
+  allow_short: true
 
 # ---------------------------------------------------------------------------
 risk:
@@ -118,6 +121,59 @@ risk:
   fx_floor_weight: 0.0
 
 # ---------------------------------------------------------------------------
+# Margin trading. Off by default: every order here can be liquidated, and a
+# liquidation is permanent -- the collateral is seized and does not come back
+# when the price does.
+margin:
+  enabled: false             # master switch; nothing below applies while false
+
+  # Collateral lives in a SEPARATE wallet and must be moved there first
+  # (NobitexREST.transfer). Margin orders draw on it, not on spot.
+  # NOTE: /wallets/transfer returns 401 with the current API key -- that scope
+  # is not enabled, so the margin wallet cannot be funded yet.
+  collateral_rial: 0
+
+  # 1..5 in steps of 0.5 on this account. Measured: real borrowing only begins
+  # above ~2x here (vol targeting keeps gross under 1 below that), and at 5x
+  # Sharpe roughly halves (1.43 -> 0.81) for no extra return. Financing is
+  # 0.05%/DAY (~18%/yr) on the borrowed amount, charged whether or not the
+  # trade works. Set to 5 by explicit instruction.
+  max_leverage: 5.0
+
+  # Refuse to hold a position whose mark is within this fraction of its
+  # liquidation price. Liquidation happens at the exchange BETWEEN our decision
+  # cycles, so the drawdown stop cannot catch it -- this is the only guard.
+  #
+  # This threshold MUST be read against the leverage. Collateral at Nx is 1/N
+  # of notional, so a freshly opened position starts roughly (1/N - maintenance)
+  # away from liquidation:
+  #     1x -> ~100%      2x -> ~45%      5x -> ~15%
+  # At 5x a brand-new position therefore sits at ~0.15, so a 0.15 threshold
+  # would flag every position from inception -- an alarm that is always on is
+  # the same as no alarm. 0.05 keeps it meaningful at 5x.
+  #
+  # Be clear about what this cannot do: at 5x a 15% adverse move liquidates,
+  # and alt markets can travel that far inside one 2-minute cycle. The guard
+  # reduces exposure to a slow bleed; it cannot save a position from a gap.
+  min_liquidation_distance: 0.05
+
+  # Cap on how much of the book may be short at once.
+  # NOTE: this is usually NOT the binding limit. The short budget is
+  #   min(max_short_gross * equity, free_collateral * leverage * 0.8)
+  # and with ~4.9M free collateral the second term (~19.6M) binds well below
+  # 0.9 * equity (~81M). Raising this alone changes nothing; adding collateral
+  # to the margin wallet is what actually increases short capacity.
+  max_short_gross: 0.90
+
+  # Concentration for the short book. Vol targeting spreads exposure across
+  # every signal, which left each short at ~3.7M notional -- barely over the
+  # 3,000,000 exchange minimum, so fees and spread ate a large share of any
+  # move. This scales each short so the SAME budget lands in fewer, larger
+  # positions; `max_short_gross` and the collateral ceiling still bind, so it
+  # cannot increase total short exposure, only its concentration.
+  short_size_multiplier: 2.5
+
+# ---------------------------------------------------------------------------
 costs:
   # Nobitex spot fees depend on your 30-day volume tier. These are the
   # account's actual rates (0.11%), not the 0.25%/0.30% entry-level defaults --
@@ -129,12 +185,25 @@ costs:
   slippage: 0.0010
   min_order_rial: 3000000      # exchange minimum for IRT markets (300k Toman)
 
+  # Margin borrow cost. Nobitex charges positionFeeRate as a DAILY renewal fee
+  # on the delegated (borrowed) amount -- 0.05%/day on this account, which is
+  # ~18%/year. Only applied when risk.max_leverage > 1. Treating borrowing as
+  # free is what makes a backtest recommend leverage that loses money.
+  position_fee_daily: 0.0005
+
 execution:
   # No-trade band. Vol targeting makes the target weight drift a little every
   # bar; without a band the book rebalances continuously and pays ~0.4% each
   # time for a position change too small to matter. Only trade when the gap
   # between current and target weight exceeds this fraction of equity.
   min_rebalance_weight: 0.05
+
+  # Rial held back from the strategy entirely. Sizing runs on
+  # (equity - cash_reserve_rial), and buys are clamped against it, so this
+  # money stays put instead of being redeployed on the next dip.
+  # Currently 1,000,000 so it can be moved to the MARGIN wallet by hand -- the
+  # API key has no wallet-transfer scope, so the bot cannot move it itself.
+  cash_reserve_rial: 1000000
 
   # Incumbency hysteresis. With ~3 fundable slots on a small account, the last
   # slot flips on tiny score differences and each flip pays a full round trip

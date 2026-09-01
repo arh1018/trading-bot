@@ -601,3 +601,50 @@ def test_incumbency_tracks_holdings_not_intent(monkeypatch):
         "selection must not overwrite incumbency with names it merely intends "
         "to buy; holdings are the only source of truth"
     )
+
+
+def test_cash_reserve_is_withheld_from_sizing():
+    """Reserved rial must not be counted as investable.
+
+    Sizing on TOTAL equity would target gross 1.0 of everything including the
+    reserve, so the bot spends it on the next dip and the money is not there
+    when the operator needs it -- here, to fund the margin wallet by hand,
+    which the API key has no scope to do.
+    """
+    import copy
+
+    from nbtrend.live.runner import LiveRunner
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["execution"]["cash_reserve_rial"] = 1_000_000
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    equity = 90_000_000.0
+    assert runner._cash_reserve() == 1_000_000
+    assert max(0.0, equity - runner._cash_reserve()) == 89_000_000.0
+
+
+def test_cash_reserve_defaults_to_zero_when_absent():
+    import copy
+
+    from nbtrend.live.runner import LiveRunner
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["execution"].pop("cash_reserve_rial", None)
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    assert runner._cash_reserve() == 0.0
+
+
+def test_a_reserve_larger_than_equity_cannot_make_investable_negative():
+    """A negative investable equity would flip every weight's sign."""
+    import copy
+
+    from nbtrend.live.runner import LiveRunner
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["execution"]["cash_reserve_rial"] = 500_000_000
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    assert max(0.0, 90_000_000.0 - runner._cash_reserve()) == 0.0

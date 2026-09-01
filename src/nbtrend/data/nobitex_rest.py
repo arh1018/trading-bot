@@ -14,13 +14,42 @@ from typing import Any
 
 import httpx
 import pandas as pd
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-from ..core.types import BookTop, Order, OrderStatus, OrderType, Side
+from ..core.types import (
+    BookTop,
+    MarginMarket,
+    MarginPosition,
+    Order,
+    OrderStatus,
+    OrderType,
+    PositionSide,
+    Side,
+)
 from ..units import toman_to_rial
 from ._util import empty_ohlcv, normalise_index
 
 log = logging.getLogger(__name__)
+
+# Status codes worth trying again. Everything else in the 4xx range is a
+# statement about the REQUEST, not about luck: a 401 does not become authorised
+# on the third attempt, and a 400 does not become well-formed. Retrying those
+# is not merely useless -- Nobitex blocks an IP for 30 minutes after roughly
+# 100 failed auth attempts, so a blanket retry turns one bad credential into
+# four strikes against that budget every call.
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable(retry_state) -> bool:
+    outcome = retry_state.outcome
+    if outcome is None or not outcome.failed:
+        return False
+    exc = outcome.exception()
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in RETRYABLE_STATUS
+    return False
 
 # `/market/udf/history` caps a single response; page through longer ranges.
 _MAX_BARS_PER_CALL = 500
@@ -87,7 +116,7 @@ class NobitexREST:
 
     # -- plumbing ----------------------------------------------------------
     @retry(
-        retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+        retry=_is_retryable,
         wait=wait_exponential(multiplier=1, min=1, max=20),
         stop=stop_after_attempt(4),
         reraise=True,
@@ -223,6 +252,21 @@ class NobitexREST:
             for w in data.get("wallets", [])
         }
 
+    def margin_wallets(self) -> dict[str, float]:
+        """Free balance in the MARGIN wallet, which is separate from spot.
+
+        Margin orders draw collateral from here and nowhere else, so a healthy
+        spot balance says nothing about whether a short can be opened. Reading
+        this is what lets the runner refuse a short it cannot fund, instead of
+        firing orders that come back `InsufficientBalance` and burn the
+        300-per-10-minutes order budget.
+        """
+        data = self._get("/users/wallets/list", type="margin")
+        return {
+            w["currency"].lower(): float(w.get("activeBalance", 0))
+            for w in data.get("wallets", [])
+        }
+
     # -- trading -----------------------------------------------------------
     def add_order(
         self,
@@ -283,12 +327,20 @@ class NobitexREST:
     def cancel_order(
         self, order_id: int | None = None, client_order_id: str | None = None
     ) -> bool:
-        # `id`, not `order` -- same stale-docs trap as `order_status`.
+        # `clientOrderId` FIRST, and it is the only one that reliably works.
+        #
+        # `/market/orders/update-status` ignores the numeric `id` for margin
+        # orders: cancelling six live margin sells by id returned "Both id and
+        # clientOrderId cannot be null" every time, while the same orders
+        # cancelled instantly by clientOrderId. The order LIST compounds this
+        # -- it returns `"id": null` and a display name ("Aptos") rather than a
+        # currency code -- so the id is often not even knowable. Every order
+        # this bot places carries a clientOrderId for exactly this reason.
         payload: dict[str, Any] = {"status": "canceled"}
-        if order_id is not None:
-            payload["id"] = order_id
         if client_order_id is not None:
             payload["clientOrderId"] = client_order_id
+        elif order_id is not None:
+            payload["id"] = order_id
         return self._post("/market/orders/update-status", payload).get("status") == "ok"
 
     def open_orders(self, src: str | None = None, dst: str | None = None) -> list[Order]:
@@ -296,6 +348,186 @@ class NobitexREST:
             "/market/orders/list", srcCurrency=src, dstCurrency=dst, status="open", details=2
         )
         return [_parse_order(o, "") for o in data.get("orders", [])]
+
+    # -- margin ------------------------------------------------------------
+    #
+    # Margin is a separate world from spot in three ways that matter:
+    #
+    #   * Collateral lives in a SEPARATE wallet. A spot balance is not usable
+    #     as margin until moved with `transfer`, and an unfunded margin wallet
+    #     fails orders with `InsufficientBalance`.
+    #   * A filled margin order opens a POSITION -- its own object, with its
+    #     own collateral and liquidation price. It is not a wallet balance,
+    #     which is why the spot runner's "position == balance" model does not
+    #     carry over.
+    #   * A `sell` order opens a SHORT. Loss on a short is unbounded above, and
+    #     crossing `liquidationPrice` forfeits the collateral outright.
+
+    def margin_markets(self) -> dict[str, MarginMarket]:
+        """Which markets support margin, and at what leverage."""
+        data = self._get("/margin/markets/list")
+        out: dict[str, MarginMarket] = {}
+        for symbol, m in (data.get("markets") or {}).items():
+            out[symbol] = MarginMarket(
+                symbol=symbol,
+                src=str(m.get("srcCurrency", "")),
+                dst=str(m.get("dstCurrency", "")),
+                max_leverage=float(m.get("maxLeverage") or 1),
+                sell_enabled=bool(m.get("sellEnabled")),
+                buy_enabled=bool(m.get("buyEnabled")),
+                position_fee_rate=float(m.get("positionFeeRate") or 0),
+            )
+        return out
+
+    def transfer(self, currency: str, amount: float, src: str, dst: str) -> bool:
+        """Move collateral between the `spot` and `margin` wallets.
+
+        The margin wallet is created by the first transfer into it. The rate
+        limit here is 10/minute -- far tighter than the order endpoints.
+        """
+        if src == dst:
+            raise ValueError("transfer src and dst wallets must differ")
+        if src not in ("spot", "margin") or dst not in ("spot", "margin"):
+            raise ValueError("wallet type must be 'spot' or 'margin'")
+        payload = {
+            "currency": currency,
+            "amount": f"{amount:.10f}".rstrip("0").rstrip("."),
+            "src": src,
+            "dst": dst,
+        }
+        return self._post("/wallets/transfer", payload).get("status") == "ok"
+
+    def add_margin_order(
+        self,
+        src: str,
+        dst: str,
+        side: Side,
+        amount: float,
+        leverage: float,
+        price: float | None = None,
+        execution: OrderType = OrderType.LIMIT,
+        stop_price: float | None = None,
+        client_order_id: str | None = None,
+    ) -> Order:
+        """Open a margin position. `side=SELL` opens a SHORT.
+
+        `leverage` must be between 1 and the market's `maxLeverage` in steps of
+        0.5; anything else is rejected with `LeverageTooHigh`. Validated here
+        so a typo costs a ValueError rather than a rejected live order.
+        """
+        if leverage < 1:
+            raise ValueError(f"leverage must be >= 1, got {leverage}")
+        if round(leverage * 2) != leverage * 2:
+            raise ValueError(f"leverage must be a multiple of 0.5, got {leverage}")
+
+        payload: dict[str, Any] = {
+            "type": side.value,
+            "srcCurrency": src,
+            "dstCurrency": dst,
+            "amount": f"{amount:.10f}".rstrip("0").rstrip("."),
+            "execution": execution.value,
+            "leverage": f"{leverage:g}",
+        }
+        if execution in (OrderType.LIMIT, OrderType.STOP_LIMIT) and price is not None:
+            payload["price"] = int(price) if float(price).is_integer() else price
+        if execution in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT):
+            if stop_price is None:
+                raise ValueError(f"{execution.value} requires stop_price")
+            payload["stopPrice"] = int(stop_price)
+        if client_order_id:
+            payload["clientOrderId"] = client_order_id[:32]
+
+        data = self._post("/margin/orders/add", payload)
+        return _parse_order(data["order"], f"{src.upper()}{'IRT' if dst == 'rls' else dst.upper()}")
+
+    def add_oco_order(
+        self,
+        src: str,
+        dst: str,
+        side: Side,
+        amount: float,
+        price: float,
+        stop_price: float,
+        stop_limit_price: float,
+        leverage: float | None = None,
+        last_price: float | None = None,
+    ) -> list[Order]:
+        """One-Cancels-Other: a take-profit and a stop-loss that cancel each other.
+
+        This is the only way to hold a stop AT THE EXCHANGE. Our chandelier
+        stop is evaluated once per decision cycle, so a gap between cycles is
+        unprotected -- and on a leveraged position that gap is exactly where
+        liquidation happens. An OCO sits in the book continuously.
+
+        `leverage` routes the pair to the margin endpoint; omit it for spot.
+
+        Nobitex requires (note 4 of the OCO docs):
+            sell:  price > last market price > stopPrice
+            buy:   price < last market price < stopPrice
+        Violating it returns `PriceConditionFailed`. When `last_price` is
+        supplied that is checked here, because a rejected order still costs a
+        round trip and a slot in the 300/10min budget.
+        """
+        if last_price is not None:
+            if side is Side.SELL and not (price > last_price > stop_price):
+                raise ValueError(
+                    f"OCO sell needs price > last > stopPrice; got "
+                    f"{price:,.0f} > {last_price:,.0f} > {stop_price:,.0f}"
+                )
+            if side is Side.BUY and not (price < last_price < stop_price):
+                raise ValueError(
+                    f"OCO buy needs price < last < stopPrice; got "
+                    f"{price:,.0f} < {last_price:,.0f} < {stop_price:,.0f}"
+                )
+
+        payload: dict[str, Any] = {
+            "mode": "oco",
+            "type": side.value,
+            "srcCurrency": src,
+            "dstCurrency": dst,
+            "amount": f"{amount:.10f}".rstrip("0").rstrip("."),
+            "price": int(price) if float(price).is_integer() else price,
+            "stopPrice": int(stop_price) if float(stop_price).is_integer() else stop_price,
+            "stopLimitPrice": (
+                int(stop_limit_price) if float(stop_limit_price).is_integer() else stop_limit_price
+            ),
+        }
+
+        path = "/market/orders/add"
+        if leverage is not None:
+            if leverage < 1 or round(leverage * 2) != leverage * 2:
+                raise ValueError(f"leverage must be >= 1 in steps of 0.5, got {leverage}")
+            payload["leverage"] = f"{leverage:g}"
+            path = "/margin/orders/add"
+
+        data = self._post(path, payload)
+        symbol = f"{src.upper()}{'IRT' if dst == 'rls' else dst.upper()}"
+        # An OCO responds with `orders` (a pair), not the single `order` key.
+        return [_parse_order(o, symbol) for o in data.get("orders", [])]
+
+    def positions(
+        self, src: str | None = None, dst: str | None = None, status: str | None = "active"
+    ) -> list[MarginPosition]:
+        data = self._get("/positions/list", srcCurrency=src, dstCurrency=dst, status=status)
+        return [_parse_position(p) for p in data.get("positions", [])]
+
+    def position_status(self, position_id: int) -> MarginPosition:
+        data = self._get(f"/positions/{int(position_id)}/status")
+        return _parse_position(data.get("position", data))
+
+    def close_position(self, position_id: int, amount: float, price: float | None = None) -> Order:
+        """Close (or partly close) a position with the opposite order.
+
+        Never retry this on a transport error, for a sharper version of the
+        spot reason: a retried close that actually landed the first time closes
+        the position twice, and the second one opens a NEW position facing the
+        other way.
+        """
+        payload: dict[str, Any] = {"amount": f"{amount:.10f}".rstrip("0").rstrip(".")}
+        if price is not None:
+            payload["price"] = int(price) if float(price).is_integer() else price
+        data = self._post(f"/positions/{int(position_id)}/close", payload)
+        return _parse_order(data["order"], "")
 
 
 # -- helpers ---------------------------------------------------------------
@@ -332,6 +564,42 @@ def _parse_order(o: dict, symbol: str) -> Order:
         filled_amount=matched,
         avg_fill_price=float(o.get("averagePrice") or 0),
         fee=float(o.get("fee") or 0),
+    )
+
+
+def _num(value: Any) -> float | None:
+    """Nobitex sends monetary fields as strings, nulls, and -- for negative
+    PNL -- with a UNICODE MINUS (U+2212), which float() rejects."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    text = str(value).replace("−", "-").replace(",", "").strip()
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_position(p: dict) -> MarginPosition:
+    src = str(p.get("srcCurrency", "")).upper()
+    dst = str(p.get("dstCurrency", "")).lower()
+    return MarginPosition(
+        id=int(p["id"]),
+        symbol=f"{src}{'IRT' if dst == 'rls' else dst.upper()}",
+        side=PositionSide(str(p.get("side", "sell")).lower()),
+        status=str(p.get("status", "")),
+        collateral=_num(p.get("collateral")) or 0.0,
+        leverage=_num(p.get("leverage")) or 1.0,
+        liquidation_price=_num(p.get("liquidationPrice")),
+        entry_price=_num(p.get("entryPrice")),
+        liability=_num(p.get("liability")) or 0.0,
+        delegated_amount=_num(p.get("delegatedAmount")) or 0.0,
+        margin_ratio=_num(p.get("marginRatio")),
+        unrealized_pnl=_num(p.get("unrealizedPNL")) or 0.0,
+        mark_price=_num(p.get("markPrice")),
+        expiration_date=p.get("expirationDate"),
+        extension_fee=_num(p.get("extensionFee")) or 0.0,
     )
 
 
