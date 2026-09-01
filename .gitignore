@@ -13,3 +13,7 @@ data/state/*
 .ruff_cache/
 .mypy_cache/
 reports/
+
+# Credential backups (.env.bak.<timestamp>) -- same secrets as .env.
+.env.bak*
+.env.*.bak
