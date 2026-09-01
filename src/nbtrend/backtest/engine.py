@@ -133,6 +133,11 @@ class Backtester:
         # ATR is in USD; convert to a fraction so it applies to the rial price.
         atr_frac = (atr_series / data["close"]).shift(1).fillna(0.0).to_numpy()
 
+        # Daily borrow fee, pro-rated to one bar. `periods_per_year / 365`
+        # is bars per day, so a 4h timeframe charges a sixth of it per bar.
+        bars_per_day = max(1.0, self.periods_per_year / 365.0)
+        borrow_rate_per_bar = float(self.costs.get("position_fee_daily", 0.0)) / bars_per_day
+
         fee = float(self.costs["taker_fee"])
         min_rebalance = float(self.cfg.execution.get("min_rebalance_weight", 0.0))
         slip = float(self.costs["slippage"])
@@ -158,21 +163,77 @@ class Backtester:
                 equity[i] = cash + amount * (prices[i - 1] if i else 0)
                 continue
 
+            # `amount` may be negative when shorting: equity is still
+            # cash + amount * price, so a rising price on a negative amount
+            # correctly erodes equity. Opening a short credits the sale
+            # proceeds to cash and leaves the borrowed units as a liability.
             mark = cash + amount * price
 
             # --- trailing stop, checked before the new target is applied ---
-            if amount > 0:
-                peak_price = max(peak_price, price)
-                stop_distance = self.limits.atr_stop_mult * atr_frac[i] * peak_price
-                if stop_distance > 0 and price <= peak_price - stop_distance:
-                    proceeds = amount * price * (1 - fee - slip)
-                    cost = amount * price * (fee + slip)
-                    cash += proceeds
+            if amount != 0:
+                # Chandelier stop, mirrored for shorts: a long trails the high
+                # water mark down, a short trails the low water mark up.
+                if amount > 0:
+                    peak_price = price if peak_price == 0.0 else max(peak_price, price)
+                else:
+                    peak_price = price if peak_price == 0.0 else min(peak_price, price)
+
+                stop_distance = self.limits.atr_stop_mult * atr_frac[i] * abs(peak_price)
+                stopped = (
+                    price <= peak_price - stop_distance
+                    if amount > 0
+                    else price >= peak_price + stop_distance
+                )
+                if stop_distance > 0 and stopped:
+                    notional = abs(amount) * price
+                    cost = notional * (fee + slip)
+                    # Closing a long sells (cash in); closing a short buys the
+                    # borrowed units back (cash out). Costs are paid either way.
+                    cash += amount * price - cost
                     costs_paid += cost
                     trades.append(
                         _make_trade(symbol, index[entry_i], index[i], entry_price, price,
                                     amount, i - entry_i, "atr_stop")
                     )
+                    amount = 0.0
+                    peak_price = 0.0
+                    mark = cash
+
+            # --- financing on borrowed funds ---
+            #
+            # Nobitex charges `positionFeeRate` as a DAILY renewal fee on the
+            # delegated amount ("نرخ کارمزد تمدید روزانه"). At 0.05%/day that
+            # is ~18%/year on the borrowed portion -- large enough to swamp the
+            # return leverage adds, so a backtest that treats borrowing as free
+            # will always recommend leverage.
+            if self.limits.max_leverage > 1.0 and borrow_rate_per_bar > 0:
+                borrowed = max(0.0, abs(amount) * price - mark)
+                if borrowed > 0:
+                    charge = borrowed * borrow_rate_per_bar
+                    cash -= charge
+                    costs_paid += charge
+                    mark = cash + amount * price
+
+            # --- liquidation, before anything else can act ---
+            #
+            # This is the risk leverage adds that a drawdown stop does NOT
+            # cover: the drawdown stop is checked against the equity peak and
+            # flattens in an orderly way, whereas liquidation is the broker
+            # seizing the collateral the moment equity/gross crosses the
+            # maintenance line. Modelling only the former makes leverage look
+            # far safer than it is.
+            if self.limits.max_leverage > 1.0 and amount != 0:
+                gross = abs(amount) * price
+                if gross > 0 and mark / gross <= self.limits.maintenance_margin:
+                    notional = abs(amount) * price
+                    cost = notional * (fee + slip)
+                    cash += amount * price - cost
+                    costs_paid += cost
+                    trades.append(
+                        _make_trade(symbol, index[entry_i], index[i], entry_price, price,
+                                    amount, i - entry_i, "liquidation")
+                    )
+                    log.warning("%s: LIQUIDATED at %s", symbol, index[i])
                     amount = 0.0
                     peak_price = 0.0
                     mark = cash
@@ -204,35 +265,57 @@ class Backtester:
                 notional = abs(sized) * price
                 if notional >= min_order:
                     cost = notional * (fee + slip)
-                    if sized > 0:
-                        needed = notional + cost
-                        if needed <= cash:
-                            cash -= needed
-                            new_amount = amount + sized
+
+                    # Split the order into the part that CLOSES the existing
+                    # position and the part that OPENS in the new direction.
+                    # Without this split a long -> short flip is silently
+                    # truncated at flat, which is exactly how the engine used
+                    # to discard every short signal.
+                    closing = 0.0
+                    if amount != 0 and np.sign(sized) != np.sign(amount):
+                        closing = min(abs(sized), abs(amount))
+                    opening = abs(sized) - closing
+
+                    if closing > 0:
+                        close_notional = closing * price
+                        close_cost = close_notional * (fee + slip)
+                        # Closing a long sells; closing a short buys back.
+                        cash += np.sign(amount) * close_notional - close_cost
+                        costs_paid += close_cost
+                        closed_amount = np.sign(amount) * closing
+                        amount -= closed_amount
+                        if abs(amount) <= amount_step:
+                            trades.append(
+                                _make_trade(symbol, index[entry_i], index[i], entry_price,
+                                            price, closed_amount, i - entry_i, "signal")
+                            )
+                            amount = 0.0
+                            peak_price = 0.0
+
+                    if opening > 0 and opening * price >= min_order:
+                        open_notional = opening * price
+                        open_cost = open_notional * (fee + slip)
+                        signed_open = np.sign(sized) * opening
+                        # A long costs cash up front; a short credits the sale
+                        # proceeds. Both pay costs. `mark` already bounds the
+                        # size, so a short cannot be opened without collateral.
+                        needed = open_notional + open_cost if signed_open > 0 else open_cost
+                        # Borrowing capacity. At 1x this is just `cash`, so
+                        # spot behaviour is untouched; above 1x the book may
+                        # run cash negative down to (leverage-1) x equity.
+                        spendable = cash + max(0.0, self.limits.max_leverage - 1.0) * mark
+                        if needed <= spendable:
+                            cash -= np.sign(signed_open) * open_notional + open_cost
+                            new_amount = amount + signed_open
                             entry_price = (
-                                (entry_price * amount + price * sized) / new_amount
+                                (entry_price * amount + price * signed_open) / new_amount
                                 if new_amount else price
                             )
                             if amount == 0.0:
                                 entry_i = i
                                 peak_price = price
                             amount = new_amount
-                            costs_paid += cost
-                    else:
-                        closing = min(abs(sized), amount)
-                        if closing > 0:
-                            proceeds = closing * price
-                            cost = proceeds * (fee + slip)
-                            cash += proceeds - cost
-                            costs_paid += cost
-                            amount -= closing
-                            if amount <= amount_step:
-                                trades.append(
-                                    _make_trade(symbol, index[entry_i], index[i], entry_price,
-                                                price, closing, i - entry_i, "signal")
-                                )
-                                amount = 0.0
-                                peak_price = 0.0
+                            costs_paid += open_cost
 
             equity[i] = cash + amount * price
             amounts[i] = amount
@@ -260,6 +343,10 @@ def _make_trade(
     amount: float, bars: int, reason: str,
 ) -> Trade:
     pnl = (exit_price - entry_price) * amount
+    # A short profits when the price FALLS, so the raw price change has to be
+    # signed by the direction. Without this a winning short reports a negative
+    # return and poisons win rate, profit factor and every downstream metric.
+    direction = -1.0 if amount < 0 else 1.0
     return Trade(
         symbol=symbol,
         entry_ts=entry_ts,
@@ -268,7 +355,7 @@ def _make_trade(
         exit_price=exit_price,
         amount=amount,
         pnl_rial=pnl,
-        return_pct=(exit_price / entry_price - 1.0) if entry_price else 0.0,
+        return_pct=direction * (exit_price / entry_price - 1.0) if entry_price else 0.0,
         bars_held=bars,
         exit_reason=reason,
     )

@@ -46,6 +46,13 @@ class RiskLimits:
     atr_stop_mult: float
     max_drawdown_stop: float
     fx_floor_weight: float = 0.0
+    max_leverage: float = 1.0
+    """Borrowing multiple. 1.0 = spot, no borrowing (the default, so existing
+    behaviour is unchanged). Above 1.0 the book may hold more than its equity,
+    which means a `maintenance_margin` breach can liquidate it."""
+    maintenance_margin: float = 0.15
+    """Equity / gross exposure below which a leveraged book is liquidated.
+    Ignored when `max_leverage` is 1.0 -- an unlevered spot book cannot be."""
 
     @classmethod
     def from_config(cls, risk_cfg: dict) -> RiskLimits:
@@ -58,6 +65,8 @@ class RiskLimits:
             atr_stop_mult=float(risk_cfg["atr_stop_mult"]),
             max_drawdown_stop=float(risk_cfg["max_drawdown_stop"]),
             fx_floor_weight=float(risk_cfg.get("fx_floor_weight", 0.0)),
+            max_leverage=float(risk_cfg.get("max_leverage", 1.0)),
+            maintenance_margin=float(risk_cfg.get("maintenance_margin", 0.15)),
         )
 
 
