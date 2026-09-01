@@ -156,6 +156,11 @@ class LiveRunner:
     _short_warned = False
     _short_notional_used = 0.0
     _pending_shorts: dict[str, str] = {}
+    _last_equity: float = 0.0
+    _suspect_equity: float = 0.0
+    MAX_EQUITY_JUMP = 5.0
+    """Refuse to size positions from an equity reading this many times the
+    previous cycle's -- no real account moves that far in one interval."""
 
     def __init__(self, cfg: Config, broker: Broker | None = None):
         self.cfg = cfg
@@ -178,6 +183,8 @@ class LiveRunner:
         self._short_notional_used = 0.0
         # symbol -> clientOrderId of a short order still working.
         self._pending_shorts: dict[str, str] = {}
+        self._last_equity = 0.0
+        self._suspect_equity = 0.0
         self.margin = self._build_margin_broker()
         self.router = OrderRouter(
             self.broker, cfg.execution, float(cfg.costs["min_order_rial"])
@@ -385,6 +392,46 @@ class LiveRunner:
             return
 
         equity = await asyncio.to_thread(self.equity_rial)
+
+        # Equity sanity gate.
+        #
+        # One live cycle read 3,725,744,251 rial against a real account of
+        # ~88,000,000 -- 42x -- and funded 56 of 56 signals on the strength of
+        # it. REST could not reproduce it, so the cause is a bad websocket book
+        # mid on some symbol. Equity feeds position SIZE, so a reading like
+        # that is not a cosmetic log error: it decides how much money to spend.
+        # An account cannot plausibly change by this much in one cycle, so
+        # treat it as bad data and skip rather than trade on it.
+        if self._last_equity and equity > self._last_equity * self.MAX_EQUITY_JUMP:
+            # A jump this large is either bad data or a real deposit, and the
+            # two are told apart by whether it PERSISTS. A glitched book mid
+            # will not reproduce next cycle; a deposit will. So the first
+            # sighting is refused and remembered, and a second, corroborating
+            # reading is accepted.
+            #
+            # Without that second chance this would latch: rejecting without
+            # updating the baseline means a genuine deposit is refused forever.
+            # A 9,840,000 -> 29,700,000 deposit really happened on this account.
+            corroborated = (
+                self._suspect_equity
+                and abs(equity - self._suspect_equity) <= self._suspect_equity * 0.10
+            )
+            if not corroborated:
+                self._suspect_equity = equity
+                log.error(
+                    "equity %s rial is %.1fx last cycle's %s -- skipping this cycle "
+                    "rather than sizing positions from it; will accept it if the "
+                    "next cycle agrees",
+                    f"{equity:,.0f}", equity / self._last_equity, f"{self._last_equity:,.0f}",
+                )
+                return
+            log.warning(
+                "equity %s rial confirmed across two cycles; treating the jump as real",
+                f"{equity:,.0f}",
+            )
+
+        self._suspect_equity = 0.0
+        self._last_equity = equity
         if not self._book:
             # Seed incumbency from what the account actually holds. Without
             # this, the first cycle after any restart has no memory of the book
@@ -488,7 +535,32 @@ class LiveRunner:
         # The router polls fills with a blocking `time.sleep` and can spend
         # `repost_after_s` (45s) per attempt. Run it off the event loop so the
         # websocket keeps answering Centrifugo's 25s ping.
-        for state in tradeable:
+        # --- pass 3c: park idle cash in USDT, not rial ---------------------
+        #
+        # Rial is not a neutral resting place, it is a losing position. Over the
+        # backtest window holding USDT returned +249.9% in rial terms while the
+        # strategy returned +2.9% to +76.3% -- the rial devalued ~71% against
+        # the dollar, and every hour the book sits in rial it pays that.
+        #
+        # `fx_floor_weight` was in the config describing exactly this ("the rial
+        # leg is a one-way carry") but was parsed and never used, so the
+        # safeguard did not exist. The unallocated part of the book is now a
+        # USDT position instead of idle rial.
+        fx_target = self._fx_target_weight(tradeable)
+        self.fx_state.target_weight = fx_target
+        if fx_target > 0 and self.fx_state.tradeable:
+            tradeable = [*tradeable, self.fx_state]
+
+        # SELLS FIRST, then buys.
+        #
+        # The book is normally fully invested, so a rotation is "sell A to
+        # afford B". Executing in arbitrary order means B's buy is attempted
+        # while the cash is still tied up in A -- it gets trimmed to whatever
+        # rial happens to be spare, lands under the 3,000,000 minimum, and is
+        # skipped. The rotation then needs a second cycle, and only completes
+        # if the signal still holds. Doing every reduction first makes the
+        # proceeds available to the buys in the SAME cycle.
+        for state in self._sells_before_buys(tradeable, investable):
             await asyncio.to_thread(self._apply_target, state, investable)
 
         # Incumbency must reflect what we actually HOLD, not what we chose.
@@ -831,11 +903,12 @@ class LiveRunner:
             return 0.0
         total = 0.0
         try:
-            free = self.rest.margin_wallets()
-            total += float(free.get("rls", 0.0))
-            usdt = float(free.get("usdt", 0.0))
-            if usdt and self.fx_state.book:
-                total += usdt * self.fx_state.book.mid
+            # Go through the broker's CACHED collateral read, not a fresh
+            # `/users/wallets/list?type=margin`. That endpoint is shared with
+            # the spot balance reads and is rate limited per IP: an uncached
+            # call here every cycle earned a 429 that aborted the whole
+            # rebalance, and shortening the cycle interval multiplies it.
+            total += float(self.margin.collateral())
         except Exception:
             log.debug("could not read the margin wallet for equity", exc_info=True)
         try:
@@ -861,6 +934,47 @@ class LiveRunner:
         if strategy_cap <= 0:
             return exchange_cap
         return min(strategy_cap, exchange_cap)
+
+    def _fx_target_weight(self, tradeable: list[SymbolState]) -> float:
+        """How much of the book should sit in USDT rather than rial.
+
+        Whatever the crypto sleeve does not claim, subject to a floor. Held to
+        a sane range: never negative, never more than the whole book, and the
+        cash reserve is deliberately NOT included -- that rial is being kept
+        aside deliberately (to fund the margin wallet by hand) and converting
+        it would defeat the point.
+        """
+        floor = float(self.cfg.risk.get("fx_floor_weight", 0.0) or 0.0)
+        crypto_gross = sum(abs(s.target_weight) for s in tradeable)
+        leftover = max(0.0, 1.0 - crypto_gross)
+        return max(0.0, min(1.0, max(floor, leftover)))
+
+    def _sells_before_buys(
+        self, states: list[SymbolState], equity: float
+    ) -> list[SymbolState]:
+        """Order execution so every reduction happens before any purchase.
+
+        Uses ONE balance snapshot: the broker caches for `balance_ttl_s`, but
+        the point is a consistent view, not just fewer calls -- classifying
+        some symbols against pre-trade balances and others against post-trade
+        ones would put buys back ahead of sells.
+        """
+        try:
+            balances = self.broker.balances()
+        except Exception:
+            log.warning("could not read balances for ordering; using list order", exc_info=True)
+            return states
+
+        def reduces(state: SymbolState) -> bool:
+            if state.book is None or equity <= 0:
+                return False
+            base, _ = _split_symbol(state.spec.nobitex)
+            current_w = balances.get(base, 0.0) * state.book.mid / equity
+            return state.target_weight < current_w
+
+        # Stable sort: reductions keep their relative order, and so do buys,
+        # which preserves the conviction ranking within each group.
+        return sorted(states, key=lambda s: 0 if reduces(s) else 1)
 
     def _cash_reserve(self) -> float:
         """Rial deliberately kept out of the strategy's hands.

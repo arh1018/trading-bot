@@ -648,3 +648,177 @@ def test_a_reserve_larger_than_equity_cannot_make_investable_negative():
     runner = object.__new__(LiveRunner)
     runner.cfg = cfg
     assert max(0.0, 90_000_000.0 - runner._cash_reserve()) == 0.0
+
+
+def test_sells_are_executed_before_buys():
+    """A fully invested book rotates by "sell A to afford B".
+
+    In arbitrary order B's buy is attempted while the cash is still in A, gets
+    trimmed to whatever rial is spare, lands under the 3,000,000 minimum and is
+    skipped -- so the rotation needs a second cycle and only completes if the
+    signal still holds. 403 live cycles produced 6 buys.
+    """
+    from types import SimpleNamespace
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    specs = {s.nobitex: s for s in cfg.universe}
+    sol = specs["SOLIRT"]
+    btc = specs["BTCIRT"]
+    equity = 100_000_000.0
+
+    # SOL is held and being cut to zero; BTC is a fresh buy.
+    seller = SymbolState(spec=sol, target_weight=0.0, score=0.1)
+    seller.book = SimpleNamespace(mid=200_000_000.0)
+    buyer = SymbolState(spec=btc, target_weight=0.30, score=0.9)
+    buyer.book = SimpleNamespace(mid=150_000_000_000.0)
+
+    base_sol, _ = "sol", "rls"
+    runner.broker = SimpleNamespace(balances=lambda: {base_sol: 0.2, "rls": 0.0})
+
+    # Buyer deliberately placed first, the order that loses the cash.
+    ordered = runner._sells_before_buys([buyer, seller], equity)
+    assert ordered[0] is seller, "the reduction must run first to fund the buy"
+    assert ordered[1] is buyer
+
+
+def test_ordering_falls_back_to_list_order_if_balances_fail():
+    """An unreadable balance must not stop the cycle executing."""
+    from types import SimpleNamespace
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = load_config()
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    def boom():
+        raise RuntimeError("api down")
+
+    runner.broker = SimpleNamespace(balances=boom)
+    states = [SymbolState(spec=s) for s in cfg.universe[:3]]
+    assert runner._sells_before_buys(states, 1_000_000.0) == states
+
+
+def test_rebalance_band_stays_above_the_exchange_minimum():
+    """A band below min_order_rial/equity lets through adjustments the exchange
+    rejects -- turnover on paper, skipped orders in practice."""
+    cfg = load_config()
+    band = float(cfg.execution["min_rebalance_weight"])
+    min_order = float(cfg.costs["min_order_rial"])
+    equity = 90_000_000.0
+    assert band * equity >= min_order, (
+        f"band {band} allows {band * equity:,.0f} rial trades, "
+        f"under the {min_order:,.0f} minimum"
+    )
+
+
+def test_idle_book_is_parked_in_usdt_not_rial():
+    """Rial is not a neutral resting place, it is a losing position.
+
+    Over the backtest window holding USDT returned +249.9% in rial terms while
+    the strategy returned +2.9% to +76.3%: the rial devalued ~71% against the
+    dollar. `fx_floor_weight` described this in the config ("the rial leg is a
+    one-way carry") but was parsed and never used, so nothing implemented it.
+    """
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    specs = cfg.universe[:3]
+    # Crypto sleeve claims 40% of the book; the other 60% must go to USDT.
+    states = [SymbolState(spec=s, target_weight=w) for s, w in zip(specs, [0.2, 0.1, 0.1], strict=True)]
+    assert runner._fx_target_weight(states) == pytest.approx(0.60)
+
+
+def test_a_fully_invested_book_leaves_nothing_for_usdt():
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    specs = cfg.universe[:2]
+    states = [SymbolState(spec=s, target_weight=w) for s, w in zip(specs, [0.6, 0.4], strict=True)]
+    assert runner._fx_target_weight(states) == pytest.approx(0.0)
+
+
+def test_fx_weight_never_goes_negative_when_gross_exceeds_one():
+    """An over-allocated book must not produce a negative USDT target, which
+    would read as a short on the currency leg."""
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    specs = cfg.universe[:2]
+    states = [SymbolState(spec=s, target_weight=w) for s, w in zip(specs, [0.9, 0.5], strict=True)]
+    assert runner._fx_target_weight(states) == 0.0
+
+
+def test_fx_floor_raises_the_usdt_leg_even_when_fully_invested():
+    import copy
+
+    from nbtrend.live.runner import LiveRunner, SymbolState
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["risk"]["fx_floor_weight"] = 0.25
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+
+    specs = cfg.universe[:2]
+    states = [SymbolState(spec=s, target_weight=w) for s, w in zip(specs, [0.6, 0.4], strict=True)]
+    assert runner._fx_target_weight(states) == pytest.approx(0.25)
+
+
+def test_an_implausible_equity_jump_is_rejected():
+    """One live cycle read 3,725,744,251 rial against a real ~88,000,000
+    account -- 42x -- and funded 56 of 56 signals on it. Equity feeds position
+    SIZE, so a bad reading decides how much money gets spent."""
+    from nbtrend.live.runner import LiveRunner
+
+    jump = LiveRunner.MAX_EQUITY_JUMP
+    # The 42x glitch is caught.
+    assert 88_000_000 * jump < 3_725_744_251
+    # Ordinary movement passes untouched.
+    assert not 88_000_000 * jump < 90_000_000
+    # A real deposit that happened on this account (9.84M -> 29.7M) passes too;
+    # the threshold must not be so tight that funding the account trips it.
+    assert not 9_840_000 * jump < 29_700_000
+
+
+def test_a_rejected_equity_jump_is_accepted_once_it_is_corroborated():
+    """The guard must not latch. Rejecting without updating the baseline would
+    refuse a genuine deposit forever -- a glitch does not reproduce, a deposit
+    does, which is exactly what separates them."""
+    from nbtrend.live.runner import LiveRunner
+
+    runner = object.__new__(LiveRunner)
+    runner._last_equity = 88_000_000.0
+    runner._suspect_equity = 0.0
+
+    glitch = 3_725_744_251.0
+    assert glitch > runner._last_equity * LiveRunner.MAX_EQUITY_JUMP
+    # First sighting: remembered, not acted on.
+    runner._suspect_equity = glitch
+
+    # A second, agreeing reading corroborates it.
+    again = glitch * 1.02
+    assert abs(again - runner._suspect_equity) <= runner._suspect_equity * 0.10
+
+    # A different wild value does not corroborate the first.
+    unrelated = glitch * 3
+    assert not abs(unrelated - runner._suspect_equity) <= runner._suspect_equity * 0.10
