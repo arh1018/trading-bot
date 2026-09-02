@@ -822,3 +822,55 @@ def test_a_rejected_equity_jump_is_accepted_once_it_is_corroborated():
     # A different wild value does not corroborate the first.
     unrelated = glitch * 3
     assert not abs(unrelated - runner._suspect_equity) <= runner._suspect_equity * 0.10
+
+
+def test_rebalance_band_tracks_equity_so_it_cannot_expire():
+    """The band is a FRACTION, the exchange minimum is a fixed RIAL amount, so
+    they drift apart as equity moves. Configured at 0.035 when equity was 90M
+    (3,150,000 -- fine), it became 2,901,853 at 82,910,076 equity, under the
+    3,000,000 minimum: every trade passed the band and was then rejected, and
+    the bot cycled 17 hours without placing an order.
+    """
+    import copy
+
+    from nbtrend.live.runner import LiveRunner
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["execution"]["min_rebalance_weight"] = 0.035
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    min_order = float(cfg.costs["min_order_rial"])
+
+    for equity in (82_910_076.0, 50_000_000.0, 20_000_000.0, 200_000_000.0):
+        band = runner._rebalance_band(equity)
+        assert band * equity >= min_order, (
+            f"at {equity:,.0f} the band allows {band * equity:,.0f}, "
+            f"under the {min_order:,.0f} minimum"
+        )
+
+
+def test_rebalance_band_keeps_the_configured_value_when_it_is_already_ample():
+    """On a large book the configured band dominates; the floor only binds when
+    equity is small enough for the fixed minimum to matter."""
+    import copy
+
+    from nbtrend.live.runner import LiveRunner
+
+    cfg = copy.deepcopy(load_config())
+    cfg.raw["execution"]["min_rebalance_weight"] = 0.035
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    assert runner._rebalance_band(1_000_000_000.0) == pytest.approx(0.035)
+
+
+def test_rebalance_band_survives_zero_equity():
+    import copy
+
+    from nbtrend.live.runner import LiveRunner
+
+    cfg = copy.deepcopy(load_config())
+    runner = object.__new__(LiveRunner)
+    runner.cfg = cfg
+    assert runner._rebalance_band(0.0) == pytest.approx(
+        float(cfg.execution["min_rebalance_weight"])
+    )

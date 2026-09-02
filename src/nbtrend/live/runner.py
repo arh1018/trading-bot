@@ -811,7 +811,7 @@ class LiveRunner:
         current_weight = held * price / equity if equity else 0.0
 
         gap = state.target_weight - current_weight
-        min_rebalance = float(self.cfg.execution.get("min_rebalance_weight", 0.0))
+        min_rebalance = self._rebalance_band(equity)
         is_state_change = (state.target_weight == 0.0) != (current_weight == 0.0)
 
         if not is_state_change and abs(gap) < min_rebalance:
@@ -975,6 +975,30 @@ class LiveRunner:
         # Stable sort: reductions keep their relative order, and so do buys,
         # which preserves the conviction ranking within each group.
         return sorted(states, key=lambda s: 0 if reduces(s) else 1)
+
+    BAND_HEADROOM = 1.10
+    """Keep the no-trade band this far above the exchange minimum, so rounding
+    and a moving price cannot drop a band-passing trade back under it."""
+
+    def _rebalance_band(self, equity: float) -> float:
+        """No-trade band as a fraction of equity, never below the exchange floor.
+
+        The band is configured as a FRACTION but `min_order_rial` is a fixed
+        RIAL amount, so the two drift apart as equity moves. Configured at 0.035
+        when equity was 90,000,000 (a 3,150,000 trade, comfortably over the
+        3,000,000 minimum), it became 2,901,853 once equity fell to 82,910,076
+        -- under the minimum. Every trade then passed the band and was rejected
+        by the exchange, and the bot cycled for 17 hours without placing an
+        order.
+
+        Deriving the floor from current equity makes that self-correcting
+        instead of a number that silently expires.
+        """
+        configured = float(self.cfg.execution.get("min_rebalance_weight", 0.0))
+        if equity <= 0:
+            return configured
+        floor = float(self.cfg.costs["min_order_rial"]) / equity * self.BAND_HEADROOM
+        return max(configured, floor)
 
     def _cash_reserve(self) -> float:
         """Rial deliberately kept out of the strategy's hands.

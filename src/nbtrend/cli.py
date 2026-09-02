@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 import typer
@@ -385,6 +386,80 @@ def margin(log_level: str = typer.Option("WARNING")) -> None:
                 f"{room:+.1%}" if room is not None else "-",
                 f"{p.unrealized_pnl:,.0f}",
             )
+        console.print(table)
+
+
+@app.command("make")
+def make(
+    symbols: str = typer.Option(
+        "AVAXIRT,XRPIRT,LINKIRT,DOTIRT",
+        help="Markets to quote. Defaults to the four measured above breakeven.",
+    ),
+    minutes: float = typer.Option(60.0, help="Stop after this many minutes."),
+    requote: float = typer.Option(30.0, help="Seconds between requotes."),
+    notional: float = typer.Option(3_000_000.0, help="Rial per quote."),
+    max_inventory: float = typer.Option(15_000_000.0, help="Rial inventory cap per symbol."),
+    min_edge_bps: float = typer.Option(4.0, help="Required bps above breakeven."),
+    live: bool = typer.Option(False, "--live", help="Place real orders (default: dry run)."),
+    log_level: str = typer.Option("INFO"),
+) -> None:
+    """Market-make the spread. Dry run unless --live is passed."""
+    _setup_logging(log_level)
+    cfg = load_config()
+
+    from .live.maker import MakerRunner, MarketMaker
+
+    wanted = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    specs = {s.nobitex: s for s in [*cfg.enabled_symbols, cfg.fx]}
+    missing = [s for s in wanted if s not in specs]
+    if missing:
+        console.print(f"[red]not in the universe:[/red] {', '.join(missing)}")
+        raise typer.Exit(code=1)
+
+    maker_fee = float(cfg.costs.get("maker_fee_irt", cfg.costs["maker_fee"]))
+    with NobitexREST(cfg.rest_url, cfg.creds.api_token,
+                api_key=cfg.creds.api_key, api_secret=cfg.creds.api_secret) as api:
+        mm = MarketMaker(
+            api, specs, wanted,
+            maker_fee=maker_fee,
+            min_edge_bps=min_edge_bps,
+            quote_notional_rial=notional,
+            max_inventory_rial=max_inventory,
+            requote_s=requote,
+            dry_run=not live,
+        )
+        runner = MakerRunner(cfg, mm, api)
+
+        mode = "[bold red]LIVE[/bold red]" if live else "[bold green]DRY RUN[/bold green]"
+        console.print(
+            f"{mode} market making {len(wanted)} symbol(s): {', '.join(wanted)}\n"
+            f"breakeven {mm.breakeven_bps():.1f} bps (maker {maker_fee:.4%} x2), "
+            f"floor {min_edge_bps:.1f} bps above it\n"
+            f"budget supports {mm.max_quotable_symbols():.1f} symbols at {requote:.0f}s requote\n"
+        )
+        if len(wanted) > mm.max_quotable_symbols():
+            console.print(
+                "[yellow]warning:[/yellow] more symbols than the order budget supports; "
+                "quotes will be skipped once it runs out\n"
+            )
+
+        deadline = time.time() + minutes * 60
+        try:
+            while time.time() < deadline:
+                runner.sweep(wanted)
+                time.sleep(requote)
+        except KeyboardInterrupt:
+            console.print("\nstopping; pulling quotes")
+        finally:
+            for sym in wanted:
+                runner.cancel_working(sym)
+
+        table = Table(title="market making session")
+        for col in ("symbol", "fills", "inventory", "realized rial"):
+            table.add_column(col)
+        for sym in wanted:
+            b = mm.books[sym]
+            table.add_row(sym, str(b.fills), f"{b.inventory:.8f}", f"{b.realized_rial:,.0f}")
         console.print(table)
 
 

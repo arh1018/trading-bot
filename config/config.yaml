@@ -194,8 +194,17 @@ costs:
   # account's actual rates (0.11%), not the 0.25%/0.30% entry-level defaults --
   # a ~2.5x difference that changes which timeframes are viable at all.
   # Re-check after any tier change; the whole cost argument below depends on it.
-  maker_fee: 0.0011
-  taker_fee: 0.0011
+  # CORRECTED to the account's real tiers (they were 0.0011/0.0011, which
+  # overstated costs by ~40% in every backtest run before this):
+  #     IRT  market: maker 0.08%, taker 0.10%
+  #     USDT market: maker 0.06%, taker 0.09%
+  # `maker_fee`/`taker_fee` are the IRT pair, since the live book is IRT.
+  maker_fee: 0.0008
+  taker_fee: 0.0010
+  maker_fee_irt: 0.0008
+  taker_fee_irt: 0.0010
+  maker_fee_usdt: 0.0006
+  taker_fee_usdt: 0.0009
   # Modelled slippage as a fraction of price, applied on top of the fee.
   slippage: 0.0010
   min_order_rial: 3000000      # exchange minimum for IRT markets (300k Toman)
@@ -220,9 +229,12 @@ execution:
   # Rial held back from the strategy entirely. Sizing runs on
   # (equity - cash_reserve_rial), and buys are clamped against it, so this
   # money stays put instead of being redeployed on the next dip.
-  # Currently 1,000,000 so it can be moved to the MARGIN wallet by hand -- the
-  # API key has no wallet-transfer scope, so the bot cannot move it itself.
-  cash_reserve_rial: 1000000
+  # Back to 0. This held 1,000,000 aside so it could be moved to the margin
+  # wallet by hand (the API key has no wallet-transfer scope). That transfer is
+  # done and margin is now disabled, so the reserve only starved the book: with
+  # 2,961,353 rial of cash, holding 1,000,000 back left less than the 3,000,000
+  # minimum order and no buy could be placed at all.
+  cash_reserve_rial: 0
 
   # Incumbency hysteresis. With ~3 fundable slots on a small account, the last
   # slot flips on tiny score differences and each flip pays a full round trip
