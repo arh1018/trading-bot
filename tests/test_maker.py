@@ -373,3 +373,92 @@ def test_a_trim_below_the_exchange_minimum_is_dropped_entirely():
 
     sides = {q.side for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))}
     assert Side.BUY not in sides
+
+
+# -- the portfolio-level cash floor -----------------------------------------
+def test_bids_stop_when_cash_hits_the_reserve():
+    """Per-symbol caps do not bound the PORTFOLIO. 12 symbols x 9,000,000
+    permits 108,000,000 of buying against an account holding 18,962,531 of
+    cash -- and since bids fill while asks do not, the maker converted
+    77,200,000 of cash into 208,250 across 12 coins in 17 minutes."""
+    mm = _mm(max_inventory_rial=9_000_000.0, quote_notional_rial=3_000_000.0,
+             min_cash_rial=10_000_000.0)
+    mid, half = 1_000_000.0, 20_000.0
+    mm._balances = {"avax": 1.0, "rls": 10_500_000.0}   # only 500k above the floor
+
+    sides = {q.side for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))}
+    assert Side.BUY not in sides, "must not spend into the reserve"
+    assert Side.SELL in sides, "selling to rebuild cash is still allowed"
+
+
+def test_bids_resume_with_cash_well_above_the_reserve():
+    mm = _mm(max_inventory_rial=9_000_000.0, quote_notional_rial=3_000_000.0,
+             min_cash_rial=10_000_000.0)
+    mid, half = 1_000_000.0, 20_000.0
+    mm._balances = {"avax": 1.0, "rls": 30_000_000.0}
+    sides = {q.side for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))}
+    assert Side.BUY in sides
+
+
+def test_cash_floor_is_inert_without_a_wallet_snapshot():
+    """Keeps the pure-logic path testable without a broker."""
+    mm = _mm(min_cash_rial=10_000_000.0)
+    assert mm.cash_room() == float("inf")
+
+
+def test_a_snapshot_without_a_rial_entry_does_not_block_bidding():
+    """Missing means unknown, not empty. Reading it as zero blocks every bid
+    and silently turns the maker into a sell-only process."""
+    mm = _mm(min_cash_rial=10_000_000.0)
+    mm._balances = {"avax": 1.0}          # no "rls" key at all
+    assert mm.cash_room() == float("inf")
+
+
+# -- orphaned inventory -----------------------------------------------------
+def _runner(mm, orderbooks):
+    from nbtrend.live.maker import MakerRunner
+
+    class _REST:
+        def orderbook(self, symbol):
+            return orderbooks[symbol]
+
+    return MakerRunner(None, mm, _REST())
+
+
+def test_held_markets_are_quoted_even_when_not_in_the_symbol_list():
+    """Cutting the symbol list from 12 to 6 stranded 39,884,121 rial -- 65% of
+    holdings -- in markets with nothing quoting them. Selling a position down
+    must not depend on that market still being worth entering."""
+    from nbtrend.live.maker import MarketMaker
+
+    specs = {"AVAXIRT": _Spec(), "SUIIRT": _Spec()}
+    mm = MarketMaker(None, specs, ["AVAXIRT"], maker_fee=0.0008, dry_run=True)
+    mm._balances = {"avax": 1.0, "sui": 6.77, "rls": 20_000_000.0}
+
+    books = {
+        "AVAXIRT": _book(998_000.0, 1_002_000.0),
+        "SUIIRT": _book(1_549_000.0, 1_551_000.0),
+    }
+    runner = _runner(mm, books)
+    held = runner.held_symbols()
+    assert "SUIIRT" in held, "a held market must be visible regardless of the config"
+
+
+def test_dust_is_not_promoted_into_a_quoted_market():
+    """zec/btc dust of ~150,000 rial is not worth an order slot."""
+    from nbtrend.live.maker import MarketMaker
+
+    specs = {"BTCIRT": _Spec()}
+    mm = MarketMaker(None, specs, [], maker_fee=0.0008, dry_run=True)
+    mm._balances = {"btc": 0.000001}
+    books = {"BTCIRT": _book(164_000_000_000.0, 165_000_000_000.0)}
+    assert _runner(mm, books).held_symbols(min_rial=1_000_000.0) == []
+
+
+def test_a_coin_outside_the_universe_is_ignored():
+    """No spec means no amount_step, so it cannot be quoted safely."""
+    from nbtrend.live.maker import MarketMaker
+
+    mm = MarketMaker(None, {"AVAXIRT": _Spec()}, ["AVAXIRT"], dry_run=True)
+    mm._balances = {"weirdcoin": 1000.0}
+    assert _runner(mm, {}).held_symbols() == []

@@ -84,6 +84,7 @@ class MarketMaker:
         requote_s: float = 30.0,
         inside_touch: float = 0.9,
         min_quote_rial: float = 3_000_000.0,
+        min_cash_rial: float = 0.0,
         max_orders_per_window: int = 150,
         dry_run: bool = True,
     ):
@@ -100,6 +101,13 @@ class MarketMaker:
         self.inside_touch = inside_touch
         # Exchange minimum: a trimmed quote below this is rejected anyway.
         self.min_quote_rial = min_quote_rial
+        # Rial the book must keep unspent. PER-SYMBOL caps do not bound the
+        # PORTFOLIO: 12 symbols x 9,000,000 permits 108,000,000 of buying
+        # against an account holding 18,962,531 of cash. Bids fill and asks
+        # do not, so without this the maker converts the whole account into
+        # inventory -- observed live, 77,200,000 of cash to 208,250 in 17
+        # minutes across 12 coins.
+        self.min_cash_rial = min_cash_rial
         self.dry_run = dry_run
 
         # Half the exchange budget by default, so this can never starve
@@ -146,6 +154,20 @@ class MarketMaker:
             return 0.0
         held_rial = self.held_rial(symbol, mid)
         return max(-1.0, min(1.0, held_rial / self.max_inventory_rial))
+
+    def cash_room(self) -> float:
+        """Rial available to spend on bids, above the reserve floor.
+
+        Read from the wallet each sweep. Returns a large number when no
+        snapshot exists so the pure-logic path is unconstrained by it.
+        """
+        # A snapshot with no rial entry means UNKNOWN, not empty. Reading it as
+        # zero blocks every bid, which silently turns the maker into a
+        # sell-only process -- a failure that looks exactly like working.
+        if self._balances is None or "rls" not in self._balances:
+            return float("inf")
+        cash = float(self._balances["rls"])
+        return max(0.0, cash - self.min_cash_rial)
 
     def held_rial(self, symbol: str, mid: float) -> float:
         """Rial value of what we ACTUALLY hold in this market.
@@ -228,7 +250,10 @@ class MarketMaker:
         # quote posted against an 8,900,000 position breaches a 9,000,000 cap
         # the moment it fills, which is how a cap gets exceeded even when it is
         # read correctly.
-        room = self.max_inventory_rial - held_rial
+        room = min(
+            self.max_inventory_rial - held_rial,
+            self.cash_room(),
+        )
         if room >= amount * bid_px:
             quotes.append(Quote(Side.BUY, bid_px, amount))
         elif room > 0:
@@ -357,6 +382,33 @@ class MakerRunner:
                 book.working.pop(coid, None)
         return cancelled
 
+    def held_symbols(self, min_rial: float = 50_000.0) -> list[str]:
+        """Every market we hold inventory in, whether or not we quote it.
+
+        Selling a position down must NEVER depend on that market still being
+        attractive to ENTER. Cutting the symbol list from 12 to 6 stranded
+        39,884,121 rial -- 65% of holdings -- in six markets with nothing
+        quoting them: a directional bet on six alt-coins that nobody chose.
+
+        Derived from the wallet, so a config change cannot orphan a position
+        again.
+        """
+        balances = self.mm._balances or {}
+        out = []
+        for cur, units in balances.items():
+            if cur == "rls" or not units:
+                continue
+            symbol = cur.upper() + "IRT"
+            if symbol not in self.mm.specs:
+                continue
+            try:
+                mid = self.rest.orderbook(symbol).mid
+            except Exception:
+                continue
+            if units * mid >= min_rial:
+                out.append(symbol)
+        return out
+
     def sweep(self, symbols: list[str]) -> None:
         """One requote pass over every symbol.
 
@@ -365,7 +417,18 @@ class MakerRunner:
         every symbol's ask sized against the same view.
         """
         self.mm.refresh_balances()
-        for sym in symbols:
+        # Quote the configured markets PLUS anything we hold. A held position
+        # with no ask is a directional bet nobody chose, and it persists until
+        # something sells it.
+        held = self.held_symbols()
+        orphans = [s for s in held if s not in symbols]
+        if orphans:
+            log.warning(
+                "holding %d market(s) outside the quote list: %s -- quoting asks "
+                "so they can be sold down",
+                len(orphans), ", ".join(orphans),
+            )
+        for sym in [*symbols, *orphans]:
             self.quote_once(sym)
 
     def quote_once(self, symbol: str) -> list[Quote]:

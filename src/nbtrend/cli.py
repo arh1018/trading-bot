@@ -400,6 +400,9 @@ def make(
     notional: float = typer.Option(3_000_000.0, help="Rial per quote."),
     max_inventory: float = typer.Option(15_000_000.0, help="Rial inventory cap per symbol."),
     min_edge_bps: float = typer.Option(4.0, help="Required bps above breakeven."),
+    min_cash: float = typer.Option(
+        0.0, help="Rial to keep unspent across the whole book (portfolio floor)."
+    ),
     live: bool = typer.Option(False, "--live", help="Place real orders (default: dry run)."),
     log_level: str = typer.Option("INFO"),
 ) -> None:
@@ -425,6 +428,7 @@ def make(
             min_edge_bps=min_edge_bps,
             quote_notional_rial=notional,
             max_inventory_rial=max_inventory,
+            min_cash_rial=min_cash,
             requote_s=requote,
             dry_run=not live,
         )
@@ -436,6 +440,7 @@ def make(
             f"breakeven {mm.breakeven_bps():.1f} bps (maker {maker_fee:.4%} x2), "
             f"floor {min_edge_bps:.1f} bps above it\n"
             f"budget supports {mm.max_quotable_symbols():.1f} symbols at {requote:.0f}s requote\n"
+            f"cash floor {min_cash:,.0f} rial; inventory cap {max_inventory:,.0f}/symbol\n"
         )
         if len(wanted) > mm.max_quotable_symbols():
             console.print(
