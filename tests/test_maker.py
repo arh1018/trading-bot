@@ -462,3 +462,47 @@ def test_a_coin_outside_the_universe_is_ignored():
     mm = MarketMaker(None, {"AVAXIRT": _Spec()}, ["AVAXIRT"], dry_run=True)
     mm._balances = {"weirdcoin": 1000.0}
     assert _runner(mm, {}).held_symbols() == []
+
+
+# -- the three ONEIRT bugs --------------------------------------------------
+def test_a_404_on_cancel_is_a_fill_not_a_failure():
+    """A resting quote that filled is gone by the time we requote, so
+    cancelling it 404s. 71 of those were logged as errors with tracebacks,
+    which hid the real problem (locked inventory) completely."""
+    import httpx
+
+    from nbtrend.live.maker import _is_missing_order
+
+    req = httpx.Request("POST", "https://apiv2.nobitex.ir/market/orders/update-status")
+    missing = httpx.HTTPStatusError(
+        "404", request=req, response=httpx.Response(404, request=req)
+    )
+    assert _is_missing_order(missing)
+
+    real = httpx.HTTPStatusError(
+        "500", request=req, response=httpx.Response(500, request=req)
+    )
+    assert not _is_missing_order(real), "a real failure must still be reported"
+
+
+def test_total_balances_includes_units_locked_in_our_own_orders():
+    """The ONEIRT bug: activeBalance excluded the 1796.48944 units blocked by
+    our own resting quote, leaving 0.08944 free -- under the 0.1 amount step,
+    so `sellable` rounded to zero and no ask was ever posted."""
+    from nbtrend.data.nobitex_rest import NobitexREST
+
+    rest = object.__new__(NobitexREST)
+    rest._get = lambda path, **kw: {
+        "wallets": [{"currency": "ONE", "balance": "1796.48944",
+                     "activeBalance": "0.08944"}]
+    }
+    assert rest.total_balances()["one"] == pytest.approx(1796.48944)
+
+
+def test_an_ask_is_quoted_for_inventory_locked_in_a_working_order():
+    """End to end: with the total balance the ask comes back."""
+    mm = _mm(quote_notional_rial=3_000_000.0, max_inventory_rial=9_000_000.0)
+    mm._balances = {"avax": 3.0, "rls": 50_000_000.0}   # total, not active
+    mid, half = 1_000_000.0, 20_000.0
+    sides = {q.side for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))}
+    assert Side.SELL in sides

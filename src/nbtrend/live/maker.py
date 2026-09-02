@@ -37,6 +37,19 @@ from ..units import round_to_step
 log = logging.getLogger(__name__)
 
 
+def _is_missing_order(exc: Exception) -> bool:
+    """True when the exchange says the order does not exist.
+
+    A resting quote that filled is gone by the time we requote, so cancelling
+    it 404s. That is success, not failure.
+    """
+    import httpx
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 404
+    return "not found" in str(exc).lower()
+
+
 @dataclass
 class Quote:
     """One side of a two-sided quote."""
@@ -290,9 +303,20 @@ class MarketMaker:
         return float(self._balances.get(base, 0.0))
 
     def refresh_balances(self) -> None:
-        """Snapshot wallet balances so asks are sized against real holdings."""
+        """Snapshot wallet balances so asks are sized against real holdings.
+
+        Uses TOTAL balance, not `activeBalance`. `activeBalance` excludes units
+        blocked in working orders -- including our own resting quotes -- so a
+        symbol whose inventory is committed to a quote reads as empty and gets
+        no ask at all. ONEIRT held 1796.48944 units with an activeBalance of
+        0.08944 (148 rial, under the 0.1 amount step), so `sellable` rounded to
+        zero and it silently quoted bid-only while looking like a 0% ask fill.
+
+        Quotes are cancelled before requoting, so the blocked units are about
+        to be free; sizing against the total is the correct view.
+        """
         try:
-            self._balances = self.rest.wallets()
+            self._balances = self.rest.total_balances()
         except Exception:
             log.warning("could not read balances; sizing asks from tracked inventory",
                         exc_info=True)
@@ -376,9 +400,19 @@ class MakerRunner:
             try:
                 if self.rest.cancel_order(client_order_id=coid):
                     cancelled += 1
-                book.working.pop(coid, None)
-            except Exception:
-                log.warning("could not cancel quote %s on %s", coid, symbol, exc_info=True)
+            except Exception as exc:
+                # A 404 means the order is GONE -- it filled, or was already
+                # cancelled. For a resting quote that is the normal outcome,
+                # not a failure: it is what earning the spread looks like.
+                # Logging it as an error with a traceback produced 71 scary
+                # warnings that hid the real problem elsewhere.
+                if _is_missing_order(exc):
+                    log.debug("quote %s on %s already gone (filled or cancelled)",
+                              coid, symbol)
+                else:
+                    log.warning("could not cancel quote %s on %s", coid, symbol,
+                                exc_info=True)
+            finally:
                 book.working.pop(coid, None)
         return cancelled
 
@@ -445,10 +479,21 @@ class MakerRunner:
 
         self.cancel_working(symbol)
         if not quotes:
-            log.info(
-                "%s: edge %.1f bps below the %.1f bps floor -- not quoting",
-                symbol, edge, self.mm.min_edge_bps,
-            )
+            # Say WHY. This used to blame the edge unconditionally and print
+            # "edge 44.1 bps below the 8.0 bps floor" -- self-contradictory,
+            # and it sent the investigation to the wrong place while the real
+            # cause (no sellable inventory) went unnoticed.
+            if edge < self.mm.min_edge_bps:
+                reason = f"edge {edge:.1f} bps under the {self.mm.min_edge_bps:.1f} bps floor"
+            elif self.mm.cash_room() <= 0:
+                reason = "no cash above the reserve, and nothing sellable"
+            else:
+                free = self.mm.available_base(symbol)
+                reason = (
+                    f"edge {edge:.1f} bps is fine, but nothing to quote: free base "
+                    f"{free:.8f} (inventory may be locked in working orders)"
+                )
+            log.info("%s: not quoting -- %s", symbol, reason)
             return []
 
         if not self.mm.can_place(len(quotes)):

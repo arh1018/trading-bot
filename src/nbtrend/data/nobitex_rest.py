@@ -252,6 +252,22 @@ class NobitexREST:
             for w in data.get("wallets", [])
         }
 
+    def total_balances(self) -> dict[str, float]:
+        """Balance per currency INCLUDING units blocked in working orders.
+
+        `wallets()` returns `activeBalance`, which excludes anything committed
+        to an open order -- the right view for "what can I spend right now".
+        It is the wrong view for a market maker sizing an ask, because its own
+        resting quote blocks the very inventory it wants to sell: ONEIRT held
+        1796.48944 units with an activeBalance of 0.08944, so it quoted
+        bid-only and looked like a 0% ask fill rate.
+        """
+        data = self._get("/users/wallets/list")
+        return {
+            w["currency"].lower(): float(w.get("balance", 0))
+            for w in data.get("wallets", [])
+        }
+
     def margin_wallets(self) -> dict[str, float]:
         """Free balance in the MARGIN wallet, which is separate from spot.
 
