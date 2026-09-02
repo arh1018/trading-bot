@@ -14,9 +14,9 @@ from nbtrend.live.maker import MarketMaker
 
 
 class _Spec:
-    def __init__(self, amount_step=1e-8):
+    def __init__(self, amount_step=1e-8, src="avax"):
         self.amount_step = amount_step
-        self.src, self.dst = "avax", "rls"
+        self.src, self.dst = src, "rls"
 
 
 def _book(bid, ask):
@@ -506,3 +506,160 @@ def test_an_ask_is_quoted_for_inventory_locked_in_a_working_order():
     mid, half = 1_000_000.0, 20_000.0
     sides = {q.side for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))}
     assert Side.SELL in sides
+
+
+def test_a_market_discovered_from_the_wallet_gets_state_on_demand():
+    """`books` is built from the CONFIGURED symbols, but the runner also quotes
+    markets found in the wallet so a position is never orphaned. Those have no
+    entry, and indexing raised KeyError: 'BTCIRT' at startup -- the orphan fix
+    and this state map disagreed about which symbols exist."""
+    from nbtrend.live.maker import MarketMaker
+
+    mm = MarketMaker(None, {"AVAXIRT": _Spec()}, ["AVAXIRT"], dry_run=True)
+    assert "BTCIRT" not in mm.books
+    book = mm.book_for("BTCIRT")
+    assert book.symbol == "BTCIRT"
+    assert mm.book_for("BTCIRT") is book, "must be stable across calls"
+
+
+def test_held_rial_works_for_an_unconfigured_market():
+    from nbtrend.live.maker import MarketMaker
+
+    mm = MarketMaker(None, {"AVAXIRT": _Spec()}, ["AVAXIRT"], dry_run=True)
+    mm._balances = {"btc": 0.5}
+    assert mm.held_rial("BTCIRT", 100.0) == pytest.approx(50.0)
+
+
+# -- fast requoting without breaching the rate limit ------------------------
+def _mk_runner(mm, tol=3.0):
+    from nbtrend.live.maker import MakerRunner
+
+    return MakerRunner(None, mm, None, requote_tolerance_bps=tol)
+
+
+def test_an_unchanged_quote_is_not_reposted():
+    """Cancel-and-repost is the whole cost of requoting: 2 placements per
+    symbol per sweep against a 300-per-10-minutes limit. At 10s on 6 symbols
+    that is 720 -- 2.4x over, so most quotes get refused and the book updates
+    LESS often than at 30s. Skipping unchanged quotes decouples how often we
+    LOOK from how often we SPEND, and preserves queue position."""
+    from nbtrend.live.maker import Quote
+
+    mm = _mm()
+    r = _mk_runner(mm)
+    quotes = [Quote(Side.BUY, 1_000_000.0, 3.0), Quote(Side.SELL, 1_004_000.0, 3.0)]
+    mm.book_for("AVAXIRT").working = {"a": object(), "b": object()}
+    r._last_quotes["AVAXIRT"] = quotes
+
+    same = [Quote(Side.BUY, 1_000_050.0, 3.0), Quote(Side.SELL, 1_004_050.0, 3.0)]
+    assert r._unchanged("AVAXIRT", same), "0.5 bps of drift is not worth a repost"
+
+
+def test_a_moved_quote_is_reposted():
+    from nbtrend.live.maker import Quote
+
+    mm = _mm()
+    r = _mk_runner(mm)
+    mm.book_for("AVAXIRT").working = {"a": object(), "b": object()}
+    r._last_quotes["AVAXIRT"] = [Quote(Side.BUY, 1_000_000.0, 3.0),
+                                 Quote(Side.SELL, 1_004_000.0, 3.0)]
+
+    moved = [Quote(Side.BUY, 1_002_000.0, 3.0), Quote(Side.SELL, 1_006_000.0, 3.0)]
+    assert not r._unchanged("AVAXIRT", moved), "20 bps of drift must repost"
+
+
+def test_a_filled_side_forces_a_repost():
+    """If a quote is gone from `working`, the pair is incomplete and must be
+    rebuilt -- otherwise a filled bid leaves us quoting one-sided forever."""
+    from nbtrend.live.maker import Quote
+
+    mm = _mm()
+    r = _mk_runner(mm)
+    quotes = [Quote(Side.BUY, 1_000_000.0, 3.0), Quote(Side.SELL, 1_004_000.0, 3.0)]
+    r._last_quotes["AVAXIRT"] = quotes
+    mm.book_for("AVAXIRT").working = {"a": object()}      # one leg filled
+    assert not r._unchanged("AVAXIRT", quotes)
+
+
+def test_a_resized_quote_is_reposted():
+    from nbtrend.live.maker import Quote
+
+    mm = _mm()
+    r = _mk_runner(mm)
+    mm.book_for("AVAXIRT").working = {"a": object(), "b": object()}
+    r._last_quotes["AVAXIRT"] = [Quote(Side.BUY, 1_000_000.0, 3.0),
+                                 Quote(Side.SELL, 1_004_000.0, 3.0)]
+    resized = [Quote(Side.BUY, 1_000_000.0, 1.0), Quote(Side.SELL, 1_004_000.0, 3.0)]
+    assert not r._unchanged("AVAXIRT", resized), "a 3x size change must repost"
+
+
+def test_balance_reads_do_not_scale_with_the_loop_rate():
+    """The wallet endpoint already returned 429s at a 60s cycle; at 10s it
+    would be read 6x as often for data that barely changes."""
+    mm = _mm()
+    r = _mk_runner(mm)
+    assert r.balance_refresh_s >= 30.0
+
+
+def test_quotes_are_reconciled_against_the_exchange_not_our_bookkeeping():
+    """`book.working` is what we BELIEVE we posted; the exchange is what is
+    actually resting, and they drift -- a cancel that 404s pops the entry
+    whether or not anything was pulled. That drift stacked three KMNOIRT bids
+    at 51,750 / 52,080 / 52,210 at once."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker, Quote
+
+    mm = MarketMaker(None, {"KMNOIRT": _Spec()}, ["KMNOIRT"], dry_run=True)
+
+    class _REST:
+        def _get(self, path, **kw):
+            return {"orders": [
+                {"clientOrderId": "mkr1", "srcCurrency": "kmno", "type": "buy"},
+                {"clientOrderId": "mkr2", "srcCurrency": "kmno", "type": "buy"},
+                {"clientOrderId": "mkr3", "srcCurrency": "kmno", "type": "buy"},
+            ]}
+
+    r = MakerRunner(None, mm, _REST())
+    r._coid_symbol = {"mkr1": "KMNOIRT", "mkr2": "KMNOIRT", "mkr3": "KMNOIRT"}
+    live = r._live_orders("KMNOIRT")
+    assert len(live) == 3, "the exchange view must see all three"
+
+    # We want a two-sided pair; three live orders can never match, so the
+    # unchanged-skip cannot fire and leave them stacked.
+    wanted = [Quote(Side.BUY, 52_000.0, 57.0), Quote(Side.SELL, 52_500.0, 57.0)]
+    assert len(live) != len(wanted)
+
+
+def test_cancel_covers_orders_we_did_not_know_about():
+    """The union of our records and the exchange's, so neither view can leave
+    an order resting."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    mm = MarketMaker(None, {"KMNOIRT": _Spec()}, ["KMNOIRT"], dry_run=False)
+    cancelled = []
+
+    class _REST:
+        def cancel_order(self, client_order_id=None, order_id=None):
+            cancelled.append(client_order_id)
+            return True
+
+    r = MakerRunner(None, mm, _REST())
+    mm.book_for("KMNOIRT").working = {"mkr_known": object()}
+    r.cancel_working("KMNOIRT", live=[{"clientOrderId": "mkr_unknown"}])
+    assert set(cancelled) == {"mkr_known", "mkr_unknown"}
+
+
+def test_orphan_selling_lives_in_the_maker_not_a_second_process():
+    """Two components selling the same inventory collide: the cron sweep's
+    resting ask blocked the units, then the maker sized its own ask from the
+    TOTAL balance and got Order Validation Failed. The maker quotes asks on
+    held markets itself, so the cron is redundant."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    mm = MarketMaker(None, {"RAYIRT": _Spec()}, [], dry_run=True)
+    mm._balances = {"ray": 3.0}
+
+    class _REST:
+        def orderbook(self, symbol):
+            return _book(1_700_000.0, 1_710_000.0)
+
+    assert "RAYIRT" in MakerRunner(None, mm, _REST()).held_symbols()

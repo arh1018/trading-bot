@@ -132,6 +132,20 @@ class MarketMaker:
         # Wallet snapshot; None means 'unknown, fall back to tracked fills'.
         self._balances: dict[str, float] | None = None
 
+    def book_for(self, symbol: str) -> SymbolBook:
+        """Per-symbol state, created on demand.
+
+        `books` is built from the CONFIGURED symbols, but the runner also
+        quotes markets discovered from the wallet so a position can never be
+        orphaned. Those have no entry, and indexing raised KeyError: 'BTCIRT'
+        on startup -- the orphan fix and this state map disagreed about which
+        symbols exist.
+        """
+        book = self.books.get(symbol)
+        if book is None:
+            book = self.books[symbol] = SymbolBook(symbol=symbol)
+        return book
+
     # -- economics ---------------------------------------------------------
     def breakeven_bps(self) -> float:
         """Both legs rest, so the cost is the maker fee TWICE."""
@@ -294,7 +308,7 @@ class MarketMaker:
         the pure-logic path stays testable without a broker.
         """
         if self._balances is None:
-            return self.books[symbol].inventory
+            return self.book_for(symbol).inventory
         base = symbol.lower()
         for suffix in ("irt", "usdt"):
             if base.endswith(suffix):
@@ -349,7 +363,7 @@ class MarketMaker:
         of whatever inventory is left -- the spread is only earned once BOTH
         sides have traded, so cash flow alone flatters an unbalanced book.
         """
-        b = self.books[symbol]
+        b = self.book_for(symbol)
         fee = price * amount * self.maker_fee
         if side is Side.BUY:
             b.inventory += amount
@@ -361,7 +375,7 @@ class MarketMaker:
 
     def pnl_rial(self, symbol: str, mid: float) -> float:
         """Realized cash plus inventory marked to the current mid."""
-        b = self.books[symbol]
+        b = self.book_for(symbol)
         return b.realized_rial + b.inventory * mid
 
     def total_pnl_rial(self, mids: dict[str, float]) -> float:
@@ -378,21 +392,80 @@ class MakerRunner:
     concurrency that would justify the extra failure modes.
     """
 
-    def __init__(self, cfg, maker: MarketMaker, rest):
+    def __init__(self, cfg, maker: MarketMaker, rest, requote_tolerance_bps: float = 3.0):
         self.cfg = cfg
         self.mm = maker
         self.rest = rest
+        # How far a quote may drift before it is worth reposting.
+        self.requote_tolerance_bps = requote_tolerance_bps
+        self._last_quotes: dict[str, list[Quote]] = {}
+        self._balances_at = 0.0
+        # clientOrderId -> symbol. The order list gives display names and a
+        # null id, so this is the only way to know which market an order is.
+        self._coid_symbol: dict[str, str] = {}
+        # Wallet reads are rate limited; decouple them from the quote loop.
+        self.balance_refresh_s = 30.0
 
-    def cancel_working(self, symbol: str) -> int:
+    def _unchanged(self, symbol: str, quotes: list[Quote]) -> bool:
+        """True when the live quotes already match what we want to post.
+
+        Compared with a tolerance in BPS, not exact equality: a quote one rial
+        away is not worth surrendering queue position and two order slots for.
+        """
+        book = self.mm.book_for(symbol)
+        if not book.working or len(book.working) != len(quotes):
+            return False
+        prev = self._last_quotes.get(symbol)
+        if not prev or len(prev) != len(quotes):
+            return False
+        for a, b in zip(sorted(prev, key=lambda q: q.side.value),
+                        sorted(quotes, key=lambda q: q.side.value), strict=True):
+            if a.side is not b.side or a.price <= 0:
+                return False
+            if abs(a.price - b.price) / a.price * 10_000 > self.requote_tolerance_bps:
+                return False
+            if a.amount <= 0 or abs(a.amount - b.amount) / a.amount > 0.02:
+                return False
+        return True
+
+    def _live_orders(self, symbol: str) -> list[dict]:
+        """Our orders actually resting on the exchange for this market.
+
+        Matched by clientOrderId, recorded when we post. The order list cannot
+        be matched on the symbol: it returns DISPLAY names ("Kamino Finance",
+        "Harmony"), not currency codes, and `"id": null` besides -- the
+        clientOrderId is the only reliable handle this exchange gives us.
+
+        Returns [] on a read failure, which makes the caller cancel and repost:
+        wasteful, but it can never stack.
+        """
+        try:
+            raw = self.rest._get("/market/orders/list", status="open", details=2)
+        except Exception:
+            log.warning("could not list live orders for %s", symbol, exc_info=True)
+            return []
+        return [
+            o for o in raw.get("orders", [])
+            if self._coid_symbol.get(str(o.get("clientOrderId") or "")) == symbol
+        ]
+
+    def cancel_working(self, symbol: str, live: list[dict] | None = None) -> int:
         """Pull our quotes before posting new ones.
 
         Requoting without cancelling leaves the old pair in the book, so the
         exposure doubles every cycle. Cancels by clientOrderId, which is the
         only handle that reliably works on this exchange.
         """
-        book = self.mm.books[symbol]
+        book = self.mm.book_for(symbol)
         cancelled = 0
-        for coid in list(book.working):
+        # Cancel what the EXCHANGE says is resting, plus anything we think we
+        # posted -- the union, so neither view can leave an order behind.
+        coids = list(book.working)
+        for o in live or []:
+            c = str(o.get("clientOrderId") or "")
+            if c and c not in coids:
+                coids.append(c)
+        for coid in coids:
             if self.mm.dry_run:
                 book.working.pop(coid, None)
                 cancelled += 1
@@ -450,7 +523,15 @@ class MakerRunner:
         endpoint is rate limited and shared, and a single snapshot also keeps
         every symbol's ask sized against the same view.
         """
-        self.mm.refresh_balances()
+        # Balances are refreshed on their OWN clock, not the loop's. The wallet
+        # endpoint is rate limited and already returned 429s at a 60s cycle;
+        # at 10s it would be read 6x as often for data that barely changes.
+        # Fills still invalidate it immediately, so this cannot hide a fill.
+        now = time.time()
+        if now - self._balances_at >= self.balance_refresh_s:
+            self.mm.refresh_balances()
+            self._balances_at = now
+
         # Quote the configured markets PLUS anything we hold. A held position
         # with no ask is a directional bet nobody chose, and it persists until
         # something sells it.
@@ -477,7 +558,34 @@ class MakerRunner:
         quotes = self.mm.make_quotes(symbol, top)
         edge = self.mm.edge_bps(top)
 
-        self.cancel_working(symbol)
+        # DO NOT REPLACE A QUOTE THAT HAS NOT MOVED.
+        #
+        # Cancel-and-repost is the entire cost of requoting: 2 placements per
+        # symbol per sweep against a 300-per-10-minutes limit. At a 10s requote
+        # on 6 symbols that is 720 -- 2.4x over, so most quotes get refused and
+        # the book updates LESS often than at 30s.
+        #
+        # But a quote only needs replacing when the price actually changed.
+        # Skipping unchanged ones decouples how often we LOOK from how often we
+        # SPEND, which is what makes a fast loop affordable. It also preserves
+        # queue position, which a needless cancel throws away.
+        # Reconcile against the EXCHANGE, not our own bookkeeping.
+        #
+        # `book.working` is what we believe we posted; the exchange is what is
+        # actually resting. They drift -- a cancel that 404s pops the entry
+        # whether or not an order was really pulled, and a skipped requote
+        # leaves entries we then compare against. That drift stacked three
+        # KMNOIRT bids at 51,750 / 52,080 / 52,210 simultaneously.
+        #
+        # Counting live orders per symbol makes stacking impossible to express:
+        # if the exchange already holds our pair and it has not moved, keep it;
+        # otherwise cancel whatever is actually there before posting.
+        live = self._live_orders(symbol)
+        if quotes and len(live) == len(quotes) and self._unchanged(symbol, quotes):
+            log.debug("%s: quotes unchanged; keeping queue position", symbol)
+            return quotes
+
+        self.cancel_working(symbol, live=live)
         if not quotes:
             # Say WHY. This used to blame the edge unconditionally and print
             # "edge 44.1 bps below the 8.0 bps floor" -- self-contradictory,
@@ -518,10 +626,15 @@ class MakerRunner:
                     src=spec.src, dst=spec.dst, side=q.side,
                     amount=q.amount, price=q.price, client_order_id=coid,
                 )
-                self.mm.books[symbol].working[coid] = order
+                self.mm.book_for(symbol).working[coid] = order
+                self._coid_symbol[coid] = symbol
                 self.mm.note_placement(1)
                 posted.append(q)
             except Exception:
                 # Never retried: a duplicate quote is real extra exposure.
                 log.exception("%s: could not post %s quote", symbol, q.side.value)
+        self._last_quotes[symbol] = posted
+        # A newly posted quote may fill at any moment, so the cached balance is
+        # now suspect: shorten its life rather than trusting it a full window.
+        self._balances_at = min(self._balances_at, time.time() - self.balance_refresh_s / 2)
         return posted
