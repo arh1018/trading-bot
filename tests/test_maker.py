@@ -71,15 +71,18 @@ def test_a_crossed_or_empty_book_is_never_quoted():
 def test_quotes_skew_down_when_long_to_shed_inventory():
     """Without skew the maker keeps buying into a falling market -- adverse
     selection accumulates on one side and the spread never covers it."""
-    mm = _mm(max_inventory_rial=10_000_000.0)
-    mm._balances = {"avax": 2.0}                 # 2,000,000 rial: stock to sell, under the cap
+    # Cap generous enough that BOTH cases still quote a bid -- at the cap the
+    # buy side is suppressed and there is nothing to compare.
+    mm = _mm(max_inventory_rial=30_000_000.0)
     mid = 1_000_000.0
     half = mid * 40 / 10_000 / 2
     book = _book(mid - half, mid + half)
 
-    mm._balances = {"avax": 0.5}                 # near flat
+    # Both cases must hold enough to quote a LEGAL ask (>= 3,000,000), or the
+    # comparison has nothing to compare -- so "flat" here means lightly long.
+    mm._balances = {"avax": 4.0}                 # 4,000,000 rial, lightly long
     flat = mm.make_quotes("AVAXIRT", book)
-    mm._balances = {"avax": 5.0}                 # 5,000,000 rial long
+    mm._balances = {"avax": 20.0}                # 20,000,000 rial, heavily long
     long_ = mm.make_quotes("AVAXIRT", book)
 
     flat_bid = next(q for q in flat if q.side is Side.BUY).price
@@ -146,7 +149,7 @@ def test_quotes_stay_inside_the_touch_and_uncrossed():
     # Huge cap so skew is ~0: this isolates the quote GEOMETRY. Skew shifting
     # the pair outside the touch is correct behaviour and is covered separately.
     mm = _mm(max_inventory_rial=10_000_000_000.0)
-    mm._balances = {"avax": 2.0}
+    mm._balances = {"avax": 6.0}
     mid, half = 1_000_000.0, 2_000.0
     book = _book(mid - half, mid + half)
     qs = mm.make_quotes("AVAXIRT", book)
@@ -229,21 +232,29 @@ def test_no_ask_is_quoted_with_zero_holdings():
 
 
 def test_the_ask_is_capped_at_the_units_actually_held():
-    mm = _mm(quote_notional_rial=3_000_000.0)
-    mm._balances = {"avax": 1.0}          # only 1 unit, quote wants 3
+    # Quote wants 8 units; we own 5. Both sizes clear the 3,000,000 minimum,
+    # so this isolates the holdings cap from the minimum-order gate.
+    mm = _mm(quote_notional_rial=8_000_000.0, max_inventory_rial=30_000_000.0)
+    mm._balances = {"avax": 5.0}
     mid, half = 1_000_000.0, 2_000.0
     ask = next(q for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))
                if q.side is Side.SELL)
-    assert ask.amount == pytest.approx(1.0)
+    assert ask.amount == pytest.approx(5.0), "capped at what we hold"
+    assert ask.notional >= 3_000_000.0, "and still a legal order"
 
 
 def test_a_full_two_sided_quote_returns_once_holdings_exist():
     mm = _mm(quote_notional_rial=3_000_000.0)
-    mm._balances = {"avax": 5.0}          # 5,000,000 rial: sellable, under cap
+    mm._balances = {"avax": 6.0}          # 6,000,000 rial: sellable, under cap
     mid, half = 1_000_000.0, 2_000.0
     qs = mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))
     assert {q.side for q in qs} == {Side.BUY, Side.SELL}
-    assert next(q for q in qs if q.side is Side.SELL).amount == pytest.approx(3.0)
+    # Sized off the BID price, not the mid: a quote sized at the mid is worth
+    # less at the bid, which put a ZROIRT bid at 2,985,259 under the 3,000,000
+    # minimum. So the amount is slightly above the naive notional/mid.
+    ask = next(q for q in qs if q.side is Side.SELL)
+    assert ask.amount == pytest.approx(3.0, rel=0.05)
+    assert ask.notional >= 3_000_000.0
 
 
 def test_without_a_snapshot_it_falls_back_to_tracked_inventory():
@@ -261,7 +272,7 @@ def test_our_own_quoted_pair_always_clears_breakeven_plus_margin():
     19.5 bps quoted, against a 16 bps breakeven -- the gate approved 5.7 bps of
     edge and the prices delivered 3.5."""
     mm = _mm(min_edge_bps=8.0, maker_fee=0.0008)     # breakeven 16, floor 24
-    mm._balances = {"avax": 2.0}
+    mm._balances = {"avax": 6.0}
     mid = 1_000_000.0
 
     for spread_bps in (21.7, 24.0, 30.2, 33.8, 60.0, 128.2):
@@ -283,7 +294,7 @@ def test_skew_shifts_the_pair_without_ever_narrowing_it(inventory):
     half-spread, so a 22.5 bps market was quoted ~10 bps on that side -- inside
     the 16 bps fee, losing on every fill. Skew must move the centre only."""
     mm = _mm(min_edge_bps=8.0, max_inventory_rial=9_000_000.0)
-    mm._balances = {"avax": 2.0}
+    mm._balances = {"avax": 6.0}
     mm.books["AVAXIRT"].inventory = inventory
     mid = 1_000_000.0
     half = mid * 25.0 / 10_000 / 2
@@ -301,7 +312,7 @@ def test_a_thin_market_is_not_narrowed_to_the_queue_priority_width():
     quoting through the fee: the 0.9x step-inside is overridden by the floor,
     so we quote 24 bps into a 25 bps market rather than 22.5."""
     mm = _mm(min_edge_bps=8.0, maker_fee=0.0008)     # needs >= 24 bps
-    mm._balances = {"avax": 2.0}
+    mm._balances = {"avax": 6.0}
     mid = 1_000_000.0
     half = mid * 25.0 / 10_000 / 2                   # market only 25 bps
     book = _book(mid - half, mid + half)
@@ -317,7 +328,7 @@ def test_a_thin_market_is_not_narrowed_to_the_queue_priority_width():
 def test_a_wide_market_is_still_quoted_inside_the_touch_for_queue_priority():
     """Where there is room, stepping inside the touch still earns the queue."""
     mm = _mm(min_edge_bps=8.0, max_inventory_rial=10_000_000_000.0)
-    mm._balances = {"avax": 2.0}
+    mm._balances = {"avax": 6.0}
     mid = 1_000_000.0
     half = mid * 128.2 / 10_000 / 2                  # HOLOIRT, measured live
     book = _book(mid - half, mid + half)
@@ -384,7 +395,7 @@ def test_bids_stop_when_cash_hits_the_reserve():
     mm = _mm(max_inventory_rial=9_000_000.0, quote_notional_rial=3_000_000.0,
              min_cash_rial=10_000_000.0)
     mid, half = 1_000_000.0, 20_000.0
-    mm._balances = {"avax": 1.0, "rls": 10_500_000.0}   # only 500k above the floor
+    mm._balances = {"avax": 6.0, "rls": 10_500_000.0}   # only 500k above the floor
 
     sides = {q.side for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))}
     assert Side.BUY not in sides, "must not spend into the reserve"
@@ -395,7 +406,7 @@ def test_bids_resume_with_cash_well_above_the_reserve():
     mm = _mm(max_inventory_rial=9_000_000.0, quote_notional_rial=3_000_000.0,
              min_cash_rial=10_000_000.0)
     mid, half = 1_000_000.0, 20_000.0
-    mm._balances = {"avax": 1.0, "rls": 30_000_000.0}
+    mm._balances = {"avax": 6.0, "rls": 30_000_000.0}
     sides = {q.side for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))}
     assert Side.BUY in sides
 
@@ -663,3 +674,367 @@ def test_orphan_selling_lives_in_the_maker_not_a_second_process():
             return _book(1_700_000.0, 1_710_000.0)
 
     assert "RAYIRT" in MakerRunner(None, mm, _REST()).held_symbols()
+
+
+# -- socket-driven quoting --------------------------------------------------
+def _sock(mm, gap=2.0):
+    from nbtrend.live.maker import SocketMakerRunner
+
+    return SocketMakerRunner(None, mm, None, None, min_requote_gap_s=gap)
+
+
+def test_a_book_update_marks_the_symbol_for_requoting():
+    """REST polling prices quotes off a book read seconds ago, so a fill
+    arrives from someone reacting to the book as it is NOW. Measured over 24h
+    that cost -80,276 rial of realized P&L across 7 markets."""
+    r = _sock(_mm())
+    assert not r.due("AVAXIRT")
+    r.on_book("AVAXIRT", _book(998_000.0, 1_002_000.0))
+    assert r.due("AVAXIRT")
+    assert r.latest_book("AVAXIRT").best_bid == 998_000.0
+
+
+def test_the_cooldown_bounds_how_often_one_symbol_can_requote():
+    """The socket changes WHEN we act, not how much: the exchange still allows
+    300 placements per 10 minutes, and one fast market must not eat it all."""
+    r = _sock(_mm(), gap=2.0)
+    r.on_book("AVAXIRT", _book(998_000.0, 1_002_000.0))
+    assert r.take_due(now=1000.0) == ["AVAXIRT"]
+
+    r.on_book("AVAXIRT", _book(998_100.0, 1_002_100.0))
+    assert r.take_due(now=1001.0) == [], "inside the cooldown"
+    assert r.take_due(now=1002.5) == ["AVAXIRT"], "past it"
+
+
+def test_an_unchanged_book_does_not_requote():
+    """Dirty flags clear when taken, so a quiet market costs nothing."""
+    r = _sock(_mm())
+    r.on_book("AVAXIRT", _book(998_000.0, 1_002_000.0))
+    assert r.take_due(now=1000.0) == ["AVAXIRT"]
+    assert r.take_due(now=2000.0) == [], "no new book, no requote"
+
+
+def test_only_changed_symbols_are_swept():
+    r = _sock(_mm())
+    r.on_book("AVAXIRT", _book(998_000.0, 1_002_000.0))
+    r.on_book("SUIIRT", _book(1_549_000.0, 1_551_000.0))
+    assert r.take_due(now=1000.0) == ["AVAXIRT", "SUIIRT"]
+
+    r.on_book("SUIIRT", _book(1_549_500.0, 1_551_500.0))
+    assert r.take_due(now=1005.0) == ["SUIIRT"], "AVAX did not move"
+
+
+def test_the_base_runner_has_no_socket_book():
+    """`quote_once` is shared; the REST runner must fall back to polling."""
+    from nbtrend.live.maker import MakerRunner
+
+    assert MakerRunner(None, _mm(), None).latest_book("AVAXIRT") is None
+
+
+def test_the_order_listing_is_fetched_once_per_sweep_not_per_symbol():
+    """Per-symbol listing was fine at a 60s poll and fatal once quoting became
+    event driven: the socket fires far more often, and a call per symbol per
+    event earned 13 x HTTP 400 and 7 x 429 in under two minutes, so nothing
+    could be placed at all."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    calls = {"n": 0}
+
+    class _REST:
+        def _get(self, path, **kw):
+            calls["n"] += 1
+            return {"orders": []}
+
+    mm = MarketMaker(None, {"AVAXIRT": _Spec(), "SUIIRT": _Spec(src="sui")},
+                     ["AVAXIRT", "SUIIRT"], dry_run=True)
+    r = MakerRunner(None, mm, _REST())
+
+    for _ in range(3):
+        r._live_orders("AVAXIRT")
+        r._live_orders("SUIIRT")
+    assert calls["n"] == 1, f"expected one shared listing, made {calls['n']}"
+
+
+def test_placing_an_order_invalidates_the_cached_listing():
+    """A stale view after a write is how duplicate quotes get posted."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def _get(self, path, **kw):
+            return {"orders": []}
+
+    r = MakerRunner(None, MarketMaker(None, {}, [], dry_run=True), _REST())
+    r._live_orders("AVAXIRT")
+    assert r._orders_at > 0
+    r._orders_at = 0.0          # what a placement does
+    assert r._orders_at == 0.0
+
+
+def test_an_ask_below_the_exchange_minimum_is_not_quoted():
+    """Capping the ask at what we HOLD is not enough -- it must also clear
+    min_order_rial. Holding 0.10045944 HOLO produced a 13,845 rial ask against
+    a 3,000,000 minimum, rejected on every sweep: 47 rejections in under two
+    minutes, which looked like rate limiting and was not."""
+    mm = _mm(quote_notional_rial=3_000_000.0, min_quote_rial=3_000_000.0,
+             max_inventory_rial=9_000_000.0)
+    mm._balances = {"holo": 0.10045944, "rls": 50_000_000.0}
+    mm.specs["HOLOIRT"] = _Spec(amount_step=0.1, src="holo")
+
+    sides = {q.side for q in mm.make_quotes("HOLOIRT", _book(137_500.0, 138_500.0))}
+    assert Side.SELL not in sides, "a dust ask is rejected by the exchange every time"
+    assert Side.BUY in sides, "the bid is still fine"
+
+
+def test_an_ask_that_clears_the_minimum_is_quoted():
+    mm = _mm(quote_notional_rial=4_000_000.0, min_quote_rial=3_000_000.0,
+             max_inventory_rial=20_000_000.0)
+    mm._balances = {"holo": 40.0, "rls": 50_000_000.0}     # ~5.5M of stock
+    mm.specs["HOLOIRT"] = _Spec(amount_step=0.1, src="holo")
+
+    ask = next(q for q in mm.make_quotes("HOLOIRT", _book(137_500.0, 138_500.0))
+               if q.side is Side.SELL)
+    assert ask.notional >= 3_000_000.0
+
+
+# -- markets the bot must never touch ---------------------------------------
+def test_a_protected_market_is_never_quoted_even_when_held():
+    """Holdings are discovered from the wallet so a position cannot be
+    orphaned -- but the same mechanism would start making a market in
+    something the ACCOUNT OWNER trades by hand. 478,875,002 rial of PAXG sat
+    in this wallet, placed by a person, and the maker could not tell it apart
+    from its own inventory."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    specs = {"PAXGIRT": _Spec(src="paxg"), "AVAXIRT": _Spec()}
+    mm = MarketMaker(None, specs, ["AVAXIRT"], dry_run=True)
+    mm._balances = {"paxg": 0.05, "avax": 6.0}
+
+    class _REST:
+        def orderbook(self, symbol):
+            return _book(9_500_000_000.0, 9_600_000_000.0) if symbol == "PAXGIRT" \
+                else _book(998_000.0, 1_002_000.0)
+
+    r = MakerRunner(None, mm, _REST())
+    r.protected = {"PAXGIRT", "XAUTIRT"}
+    held = r.held_symbols()
+    assert "PAXGIRT" not in held, "the owner's gold must never be quoted"
+    assert "AVAXIRT" in held, "our own inventory still is"
+
+
+def test_the_gold_pairs_are_protected_by_default():
+    """A default the operator has to actively remove, not one they must
+    remember to add."""
+    import inspect
+
+    from nbtrend.cli import make
+
+    default = inspect.signature(make).parameters["protect"].default
+    text = getattr(default, "default", default)
+    for pair in ("PAXGIRT", "XAUTIRT"):
+        assert pair in str(text)
+
+
+# -- sweep-level accounting -------------------------------------------------
+def test_cash_committed_earlier_in_a_sweep_limits_later_symbols():
+    """The wallet snapshot is up to 30s old, so twelve symbols quoting in quick
+    succession all saw the same pre-commitment cash and each concluded there
+    was room: 48,981,598 fell to 7,118,000 straight through an 8,000,000
+    floor. The floor bounded ONE bid, never a sweep of twelve."""
+    mm = _mm(min_cash_rial=8_000_000.0)
+    mm._balances = {"rls": 20_000_000.0}
+    assert mm.cash_room() == pytest.approx(12_000_000.0)
+
+    mm.commit_cash(3_000_000.0)
+    assert mm.cash_room() == pytest.approx(9_000_000.0)
+    mm.commit_cash(9_000_000.0)
+    assert mm.cash_room() == 0.0, "the floor must hold across the whole sweep"
+
+
+def test_twelve_bids_cannot_spend_through_the_floor():
+    """The exact live failure, in one assertion."""
+    mm = _mm(min_cash_rial=8_000_000.0)
+    mm._balances = {"rls": 48_981_598.0}
+    spent = 0.0
+    for _ in range(12):
+        if mm.cash_room() < 3_000_000.0:
+            break
+        mm.commit_cash(3_000_000.0)
+        spent += 3_000_000.0
+    assert 48_981_598.0 - spent >= 8_000_000.0, (
+        f"spent {spent:,.0f}, leaving {48_981_598.0 - spent:,.0f} under the floor"
+    )
+
+
+def test_commitments_reset_between_sweeps():
+    """The next sweep's snapshot already reflects the fills, so carrying the
+    commitment forward would double-count it and freeze bidding."""
+    mm = _mm(min_cash_rial=0.0)
+    mm._balances = {"rls": 10_000_000.0}
+    mm.commit_cash(6_000_000.0)
+    assert mm.cash_room() == pytest.approx(4_000_000.0)
+    mm.reset_commitments()
+    assert mm.cash_room() == pytest.approx(10_000_000.0)
+
+
+def test_an_order_posted_this_sweep_is_visible_before_the_cache_refreshes():
+    """A symbol quoted twice inside the 20s listing cache could not see its own
+    first order and posted a second -- Harmony and Raydium both doubled."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def _get(self, path, **kw):
+            return {"orders": []}          # stale: predates our placement
+
+    mm = MarketMaker(None, {"ONEIRT": _Spec(src="one")}, ["ONEIRT"], dry_run=True)
+    r = MakerRunner(None, mm, _REST())
+    assert r._live_orders("ONEIRT") == []
+
+    mm.book_for("ONEIRT").working["mkr-just-posted"] = object()
+    assert len(r._live_orders("ONEIRT")) == 1, "our own fresh order must count"
+
+
+# -- global fair value ------------------------------------------------------
+def test_fair_value_is_global_price_times_fx():
+    """The local book is one venue's opinion. `global_usd x USDT/IRT` is what
+    the asset is actually worth, and quoting blind to it means our bid rests
+    where the coin USED to be worth -- adverse selection arriving through
+    price rather than queue position."""
+    mm = _mm()
+    mm.set_fair("AVAXIRT", global_usd=25.0, fx_rial_per_usdt=1_982_000.0)
+    assert mm.fair_rial("AVAXIRT") == pytest.approx(25.0 * 1_982_000.0)
+
+
+def test_fair_value_respects_the_scaled_market_multiplier():
+    """1M_PEPEIRT quotes a MILLION pepe, so its fair price is 1,000,000x the
+    per-unit global price. Dividing instead gave a fair value of 0 and a basis
+    of 99,568,862,847,924% -- caught against live books."""
+    mm = _mm()
+    mm.set_fair("1M_PEPEIRT", global_usd=0.000008, fx_rial_per_usdt=1_982_000.0,
+                multiplier=1_000_000)
+    assert mm.fair_rial("1M_PEPEIRT") == pytest.approx(0.000008 * 1_982_000.0 * 1_000_000)
+
+
+def test_a_scaled_market_basis_is_sane_against_a_real_book():
+    """1M_PEPEIRT printed 8,273,105 against a per-unit global price; with the
+    multiplier applied correctly the basis must be a few percent, not trillions."""
+    mm = _mm()
+    mm.set_fair("1M_PEPEIRT", global_usd=0.0000037, fx_rial_per_usdt=2_199_875.0,
+                multiplier=1_000_000)
+    basis = mm.basis("1M_PEPEIRT", _book(8_270_000.0, 8_276_000.0))
+    assert abs(basis) < 0.20, f"basis {basis:.2%} is not a plausible dislocation"
+
+
+def test_basis_measures_local_richness_against_global():
+    mm = _mm()
+    fair = 1_000_000.0
+    mm.set_fair("AVAXIRT", global_usd=1.0, fx_rial_per_usdt=fair)
+    assert mm.basis("AVAXIRT", _book(1_019_000.0, 1_021_000.0)) == pytest.approx(0.02, abs=1e-4)
+    assert mm.basis("AVAXIRT", _book(979_000.0, 981_000.0)) == pytest.approx(-0.02, abs=1e-4)
+
+
+def test_a_dislocated_market_is_not_quoted():
+    """A local book far from global fair is usually mid-repricing: quoting into
+    it means buying just before the local price catches down. The spread looks
+    identical; the fill is systematically bad."""
+    mm = _mm(max_basis=0.02)
+    mm._balances = {"avax": 6.0, "rls": 50_000_000.0}
+    mm.set_fair("AVAXIRT", global_usd=1.0, fx_rial_per_usdt=1_000_000.0)
+    # Local trading 5% rich against global, with a healthy 40 bps spread.
+    assert mm.make_quotes("AVAXIRT", _book(1_048_000.0, 1_052_000.0)) == []
+
+
+def test_a_market_near_fair_is_quoted_normally():
+    mm = _mm(max_basis=0.02)
+    mm._balances = {"avax": 6.0, "rls": 50_000_000.0}
+    mm.set_fair("AVAXIRT", global_usd=1.0, fx_rial_per_usdt=1_000_000.0)
+    assert mm.make_quotes("AVAXIRT", _book(998_000.0, 1_002_000.0)), "0.0% basis must quote"
+
+
+def test_quotes_are_pulled_toward_global_fair():
+    """Blended, not replaced: the fair value is itself an estimate built from a
+    global feed and an FX rate, both with their own staleness."""
+    mm = _mm(max_basis=0.05, fair_weight=0.5)
+    mm._balances = {"avax": 6.0, "rls": 50_000_000.0}
+    book = _book(1_018_000.0, 1_022_000.0)          # local mid 1,020,000
+
+    no_fair = mm.make_quotes("AVAXIRT", book)
+    mid_no = sum(q.price for q in no_fair) / len(no_fair)
+
+    mm.set_fair("AVAXIRT", global_usd=1.0, fx_rial_per_usdt=1_000_000.0)  # fair below
+    with_fair = mm.make_quotes("AVAXIRT", book)
+    mid_with = sum(q.price for q in with_fair) / len(with_fair)
+
+    assert mid_with < mid_no, "quotes must move toward the cheaper global price"
+    assert mid_with > 1_000_000.0, "but not all the way -- the local book still counts"
+
+
+def test_no_fair_value_falls_back_to_the_local_book():
+    """A missing global price must not stop trading, only remove the anchor."""
+    mm = _mm()
+    mm._balances = {"avax": 6.0, "rls": 50_000_000.0}
+    assert mm.fair_rial("AVAXIRT") is None
+    assert mm.basis("AVAXIRT", _book(998_000.0, 1_002_000.0)) is None
+    assert mm.make_quotes("AVAXIRT", _book(998_000.0, 1_002_000.0))
+
+
+# -- price ticks ------------------------------------------------------------
+def test_prices_are_rounded_to_the_market_tick():
+    """Amounts were always stepped; prices never were. A market with
+    price_step 10 received 78,445.8497 and rejected every quote -- 76
+    "Order Validation Failed" on TNSRIRT alone."""
+    mm = _mm(max_inventory_rial=30_000_000.0)
+    mm._balances = {"tnsr": 100.0, "rls": 50_000_000.0}
+    mm.specs["TNSRIRT"] = _Spec(amount_step=0.01, src="tnsr")
+    mm.specs["TNSRIRT"].price_step = 10.0
+
+    for q in mm.make_quotes("TNSRIRT", _book(78_060.0, 78_630.0)):
+        assert q.price % 10 == 0, f"{q.side.value} price {q.price} is off the 10 tick"
+
+
+def test_tick_rounding_widens_the_pair_never_narrows_it():
+    """Rounding toward the mid would pull the quotes back through the fee
+    floor that was just enforced -- so the bid rounds DOWN and the ask UP."""
+    mm = _mm(max_inventory_rial=30_000_000.0, min_edge_bps=8.0)
+    mm._balances = {"tnsr": 100.0, "rls": 50_000_000.0}
+    mm.specs["TNSRIRT"] = _Spec(amount_step=0.01, src="tnsr")
+    mm.specs["TNSRIRT"].price_step = 100.0        # a coarse tick
+
+    qs = mm.make_quotes("TNSRIRT", _book(78_000.0, 78_600.0))
+    bid = next(q.price for q in qs if q.side is Side.BUY)
+    ask = next(q.price for q in qs if q.side is Side.SELL)
+    assert mm.quoted_edge_bps(bid, ask) >= mm.min_edge_bps
+
+
+def test_a_market_without_a_tick_is_unaffected():
+    mm = _mm()
+    mm._balances = {"avax": 6.0, "rls": 50_000_000.0}
+    assert mm.make_quotes("AVAXIRT", _book(998_000.0, 1_002_000.0))
+
+
+# -- ask sizing must respect what is actually sellable -----------------------
+def test_blocked_units_from_our_own_quote_count_as_sellable():
+    """They are released by `cancel_working` moments before we repost. ONEIRT
+    held 1796.48944 with an activeBalance of 0.08944 and quoted no ask at all."""
+    mm = _mm()
+    mm.books["AVAXIRT"].working = {"mkr-ours": object()}
+    assert mm._own_blocked("avax", blocked=38.1) == pytest.approx(38.1)
+
+
+def test_blocked_units_we_did_not_place_are_not_sellable():
+    """Sizing asks off TOTAL balance tried to sell 38.7 TNSR against 0.63 free
+    and produced 240 opaque "Order Validation Failed" rejections."""
+    mm = _mm()
+    assert not mm.books.get("TNSRIRT") or not mm.books["TNSRIRT"].working
+    assert mm._own_blocked("tnsr", blocked=38.1) == 0.0
+
+
+def test_balances_detailed_splits_free_from_blocked():
+    from nbtrend.data.nobitex_rest import NobitexREST
+
+    rest = object.__new__(NobitexREST)
+    rest._get = lambda path, **kw: {"wallets": [
+        {"currency": "TNSR", "balance": "38.727659", "activeBalance": "0.627659"},
+    ]}
+    free, blocked = rest.balances_detailed()["tnsr"]
+    assert free == pytest.approx(0.627659)
+    assert blocked == pytest.approx(38.1)

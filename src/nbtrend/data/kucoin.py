@@ -136,3 +136,32 @@ def _to_frame(candles: list[list]) -> pd.DataFrame:
 
 def fetch_ohlcv_sync(symbol: str, resolution: str, bars: int = 5000) -> pd.DataFrame:
     return asyncio.run(KuCoinFeed().fetch_ohlcv(symbol, resolution, bars))
+
+
+def all_tickers(base_url: str = BASE_URL, timeout_s: float = 15.0) -> dict[str, float]:
+    """Last price for EVERY KuCoin market, in one request.
+
+    A maker needs a global reference for a dozen symbols every minute. Fetching
+    OHLCV per symbol would be a dozen calls for data we use one number from;
+    this is one call for all of them, keyed as "BTC-USDT".
+    """
+    import httpx
+
+    with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout_s) as client:
+        resp = client.get("/api/v1/market/allTickers")
+        resp.raise_for_status()
+        body = resp.json()
+    if body.get("code") != "200000":
+        raise RuntimeError(f"kucoin allTickers: {body.get('msg', body.get('code'))}")
+
+    out: dict[str, float] = {}
+    for t in (body.get("data") or {}).get("ticker") or []:
+        sym = str(t.get("symbol") or "")
+        raw = t.get("last") or t.get("buy")
+        try:
+            price = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if sym and price > 0:
+            out[sym] = price
+    return out

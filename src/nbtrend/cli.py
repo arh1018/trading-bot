@@ -264,6 +264,68 @@ def run(
         console.print("\nstopped")
 
 
+async def _socket_loop(cfg, mm, api, symbols, deadline, fallback_s: float,
+                       protected: set[str] | None = None) -> None:
+    """Quote from websocket book events rather than a polling clock.
+
+    The blocking work -- placing and cancelling orders -- runs in a thread, not
+    on the event loop. A REST call inside the websocket handler is what starved
+    Centrifugo's 25s ping and got the trend runner dropped for "no pong".
+    """
+    import contextlib
+
+    from .data.nobitex_ws import NobitexWS, book_top_from_payload, orderbook_channel
+    from .live.maker import SocketMakerRunner
+
+    ws = NobitexWS(cfg.ws_url)
+    runner = SocketMakerRunner(cfg, mm, api, ws)
+    runner.protected = set(protected or ())
+
+    def _handler(symbol: str):
+        # Handlers are called as (channel, payload) -- see nobitex_ws.Handler.
+        def _on(_channel: str, payload: dict) -> None:
+            top = book_top_from_payload(symbol, payload)
+            if top is not None:
+                runner.on_book(symbol, top)
+        return _on
+
+    for sym in symbols:
+        ws.on(orderbook_channel(sym), _handler(sym))
+
+    stop = asyncio.Event()
+    ws_task = asyncio.create_task(ws.run(stop))
+    console.print(f"websocket: subscribed to {len(symbols)} orderbook channel(s)")
+
+    try:
+        # Wait for the first books so we never quote off an empty view.
+        for _ in range(60):
+            if all(runner.latest_book(s) for s in symbols):
+                break
+            await asyncio.sleep(1)
+
+        await asyncio.to_thread(mm.refresh_balances)
+        while time.time() < deadline:
+            due = runner.take_due()
+            if not due:
+                await asyncio.sleep(1.0)
+                continue
+            if ws.seconds_since_message > 120:
+                console.print("[yellow]websocket stale; pulling quotes[/yellow]")
+                for sym in symbols:
+                    await asyncio.to_thread(runner.cancel_working, sym)
+                await asyncio.sleep(fallback_s)
+                continue
+            await asyncio.to_thread(runner.sweep, due)
+    finally:
+        stop.set()
+        ws_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ws_task
+        for sym in symbols:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(runner.cancel_working, sym)
+
+
 @app.command()
 def doctor(log_level: str = typer.Option("WARNING")) -> None:
     """Check connectivity, credentials, and the rial/toman unit convention."""
@@ -404,6 +466,14 @@ def make(
         0.0, help="Rial to keep unspent across the whole book (portfolio floor)."
     ),
     live: bool = typer.Option(False, "--live", help="Place real orders (default: dry run)."),
+    socket: bool = typer.Option(
+        True, help="Drive quoting from the websocket book instead of polling."
+    ),
+    protect: str = typer.Option(
+        "PAXGIRT,XAUTIRT,PAXGUSDT,XAUTUSDT",
+        help="Markets the bot must never quote, even if held (comma separated). "
+             "Defaults to the gold pairs, which the account owner trades by hand.",
+    ),
     log_level: str = typer.Option("INFO"),
 ) -> None:
     """Market-make the spread. Dry run unless --live is passed."""
@@ -433,6 +503,8 @@ def make(
             dry_run=not live,
         )
         runner = MakerRunner(cfg, mm, api)
+        protected = {p.strip().upper() for p in protect.split(',') if p.strip()}
+        runner.protected = protected
 
         mode = "[bold red]LIVE[/bold red]" if live else "[bold green]DRY RUN[/bold green]"
         console.print(
@@ -450,9 +522,12 @@ def make(
 
         deadline = time.time() + minutes * 60
         try:
-            while time.time() < deadline:
-                runner.sweep(wanted)
-                time.sleep(requote)
+            if socket:
+                asyncio.run(_socket_loop(cfg, mm, api, wanted, deadline, requote, protected))
+            else:
+                while time.time() < deadline:
+                    runner.sweep(wanted)
+                    time.sleep(requote)
         except KeyboardInterrupt:
             console.print("\nstopping; pulling quotes")
         finally:

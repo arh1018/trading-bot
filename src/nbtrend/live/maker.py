@@ -28,6 +28,7 @@ deliberately.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -98,6 +99,8 @@ class MarketMaker:
         inside_touch: float = 0.9,
         min_quote_rial: float = 3_000_000.0,
         min_cash_rial: float = 0.0,
+        max_basis: float = 0.02,
+        fair_weight: float = 0.5,
         max_orders_per_window: int = 150,
         dry_run: bool = True,
     ):
@@ -121,6 +124,13 @@ class MarketMaker:
         # inventory -- observed live, 77,200,000 of cash to 208,250 in 17
         # minutes across 12 coins.
         self.min_cash_rial = min_cash_rial
+        # How far the local book may sit from global fair before we stand
+        # aside. The trend runner uses 5%; a maker is far more exposed to
+        # this because it rests orders rather than crossing, so 2%.
+        self.max_basis = max_basis
+        # How far to pull quotes toward global fair. 0 = pure local book,
+        # 1 = ignore the local book entirely. Both extremes are wrong.
+        self.fair_weight = fair_weight
         self.dry_run = dry_run
 
         # Half the exchange budget by default, so this can never starve
@@ -131,6 +141,10 @@ class MarketMaker:
         self.books: dict[str, SymbolBook] = {s: SymbolBook(symbol=s) for s in symbols}
         # Wallet snapshot; None means 'unknown, fall back to tracked fills'.
         self._balances: dict[str, float] | None = None
+        # Rial committed to bids during the current sweep.
+        self._committed_rial = 0.0
+        # symbol -> global fair value in rial.
+        self._fair: dict[str, float] = {}
 
     def book_for(self, symbol: str) -> SymbolBook:
         """Per-symbol state, created on demand.
@@ -193,8 +207,21 @@ class MarketMaker:
         # sell-only process -- a failure that looks exactly like working.
         if self._balances is None or "rls" not in self._balances:
             return float("inf")
-        cash = float(self._balances["rls"])
+        # Subtract what THIS sweep has already committed. The wallet snapshot
+        # is up to 30s old, so twelve symbols quoting in quick succession all
+        # saw the same pre-commitment cash and each concluded there was room:
+        # 48,981,598 fell to 7,118,000, straight through an 8,000,000 floor.
+        # The floor bounded one bid, never a sweep of twelve.
+        cash = float(self._balances["rls"]) - self._committed_rial
         return max(0.0, cash - self.min_cash_rial)
+
+    def commit_cash(self, rial: float) -> None:
+        """Record rial spent this sweep, before the wallet reflects it."""
+        self._committed_rial += max(0.0, rial)
+
+    def reset_commitments(self) -> None:
+        """Called at the start of each sweep, once balances are refreshed."""
+        self._committed_rial = 0.0
 
     def held_rial(self, symbol: str, mid: float) -> float:
         """Rial value of what we ACTUALLY hold in this market.
@@ -222,9 +249,55 @@ class MarketMaker:
             return 0.0
         return (ask - bid) / mid * 10_000 - self.breakeven_bps()
 
+    def fair_rial(self, symbol: str) -> float | None:
+        """What the asset is worth globally, converted to rial.
+
+        `global_usd x USDT/IRT`. The local book is only one venue's opinion; a
+        quote priced purely off it is blind to the asset having moved on every
+        other exchange. That is a second source of adverse selection on top of
+        the queue: our bid rests at a stale rial price while the world reprices
+        the coin, and the fill we get is precisely the one we did not want.
+        """
+        ref = self._fair.get(symbol)
+        return ref if ref and ref > 0 else None
+
+    def set_fair(self, symbol: str, global_usd: float, fx_rial_per_usdt: float,
+                 multiplier: int = 1) -> None:
+        """Record the global reference price for a market."""
+        if global_usd > 0 and fx_rial_per_usdt > 0:
+            # MULTIPLY. 1K_SHIBIRT quotes a THOUSAND shib, so its fair price is
+            # 1000x the per-unit global price, not a thousandth. Dividing gave
+            # 1M_PEPEIRT a fair value of 0 and a basis of 99,568,862,847,924%.
+            # Reuses the canonical helper rather than restating the arithmetic.
+            from ..data.fx import fair_rial_price
+
+            self._fair[symbol] = fair_rial_price(
+                global_usd, fx_rial_per_usdt, max(1, multiplier)
+            )
+
+    def basis(self, symbol: str, book: BookTop) -> float | None:
+        """Local mid versus global fair, as a fraction. + means locally rich."""
+        fair = self.fair_rial(symbol)
+        if not fair or book.mid <= 0:
+            return None
+        return book.mid / fair - 1.0
+
     def make_quotes(self, symbol: str, book: BookTop) -> list[Quote]:
         """Two-sided quote, skewed against inventory, or [] if not worth it."""
         if not self.is_worth_quoting(book):
+            return []
+
+        # REFUSE a market dislocated from global pricing. A local book trading
+        # far from `global_usd x fx` is usually mid-repricing, and quoting into
+        # that means buying just before the local price catches down (or
+        # selling before it catches up). The spread looks the same; the fill is
+        # systematically bad.
+        drift = self.basis(symbol, book)
+        if drift is not None and abs(drift) > self.max_basis:
+            log.info(
+                "%s: local mid is %+.2f%% from global fair (limit %.2f%%) -- not quoting",
+                symbol, drift * 100, self.max_basis * 100,
+            )
             return []
 
         spec = self.specs[symbol]
@@ -257,14 +330,52 @@ class MarketMaker:
         floor_half = (target * mid / 2.0) / (1.0 + target * skew / 2.0)
         half_width = max(half * self.inside_touch, floor_half)
 
+        # Anchor the centre toward GLOBAL fair, not purely the local mid.
+        #
+        # The local mid is one venue's opinion and lags the world. Pricing off
+        # it alone means our bid rests where the coin used to be worth, so the
+        # counterparty picking us off is the one who already saw the move --
+        # the same adverse selection that made realized P&L negative, arriving
+        # through price rather than through queue position.
+        #
+        # Blended rather than replaced: the fair value is itself an estimate
+        # (a global feed and an FX rate, both with their own staleness), and
+        # quoting purely off it would ignore the book we actually trade in.
+        anchor = mid
+        fair = self.fair_rial(symbol)
+        if fair:
+            anchor = mid * (1.0 - self.fair_weight) + fair * self.fair_weight
+
         # Skew displaces the centre; it no longer touches the width.
-        centre = mid - skew * half_width
+        centre = anchor - skew * half_width
         bid_px = centre - half_width
         ask_px = centre + half_width
         if ask_px <= bid_px:
             return []
 
-        amount = round_to_step(self.quote_notional / mid, spec.amount_step)
+        # ROUND PRICES TO THE TICK. Amounts were always stepped; prices never
+        # were, so a market with price_step 10 got 78,445.8497 and rejected
+        # every quote -- 76 "Order Validation Failed" on TNSRIRT alone. Round
+        # the bid DOWN and the ask UP: rounding either toward the mid would
+        # narrow the pair back through the fee floor we just enforced.
+        tick = float(getattr(spec, "price_step", 0) or 0)
+        if tick > 0:
+            bid_px = math.floor(bid_px / tick) * tick
+            ask_px = math.ceil(ask_px / tick) * tick
+            if ask_px <= bid_px:
+                return []
+
+        # Size from the QUOTED price, not the mid, and round the amount UP to
+        # the step. Sizing off the mid then stepping the amount down left
+        # notionals hovering either side of the 3,000,000 minimum -- a
+        # 2,985,259 bid on ZROIRT was rejected while the ask beside it passed
+        # at 3,002,160. Add a small buffer so tick and step rounding cannot
+        # drop a quote back under the floor.
+        # Sizing off bid_px (not the mid) is what fixes the original defect:
+        # a quote sized at the mid is worth LESS at the bid, which is how a
+        # ZROIRT bid landed at 2,985,259 under a 3,000,000 minimum.
+        step = spec.amount_step or 1e-8
+        amount = math.ceil(self.quote_notional / bid_px / step) * step
         if amount <= 0:
             return []
 
@@ -281,12 +392,28 @@ class MarketMaker:
             self.max_inventory_rial - held_rial,
             self.cash_room(),
         )
-        if room >= amount * bid_px:
+        # One rial of tolerance. Rounding the amount up to its step can put
+        # the notional fractions of a rial over an exactly-equal room -- 0.005
+        # rial cost an entire bid here -- and sub-rial precision is meaningless
+        # for money.
+        if room + 1.0 >= amount * bid_px:
             quotes.append(Quote(Side.BUY, bid_px, amount))
         elif room > 0:
+            # Rounding the size UP to clear the exchange minimum fights the cap
+            # ceiling: 6,000,000 held against a 9,000,000 cap leaves exactly
+            # 3,000,000 of room, and a quote rounded up to 3,173,567 exceeded
+            # it and was suppressed entirely. Round the trim DOWN to the step
+            # (it must fit the room) and only quote it if it still clears the
+            # minimum -- otherwise there is genuinely no legal bid to make.
             trimmed = round_to_step(room / bid_px, spec.amount_step)
             if trimmed > 0 and trimmed * bid_px >= self.min_quote_rial:
                 quotes.append(Quote(Side.BUY, bid_px, trimmed))
+            elif room >= self.min_quote_rial:
+                # The step is coarse enough that rounding down lost the
+                # minimum; the room is there, so nudge one step back up.
+                stepped = trimmed + (spec.amount_step or 0)
+                if stepped * bid_px <= room:
+                    quotes.append(Quote(Side.BUY, bid_px, stepped))
 
         # SPOT CANNOT SELL WHAT IT DOES NOT HOLD. Inventory here counts only
         # our own fills, so on a freshly funded account it is 0 and every ask
@@ -297,7 +424,17 @@ class MarketMaker:
         sellable = round_to_step(
             min(amount, max(0.0, self.available_base(symbol))), spec.amount_step
         )
-        if held_rial > -self.max_inventory_rial and sellable > 0:
+        # The ask must clear the exchange minimum too. Capping it at what we
+        # HOLD is not enough: holding 0.10045944 HOLO produced a 13,845 rial
+        # ask against a 3,000,000 minimum, rejected "Order Validation Failed"
+        # on every single sweep -- 47 times in under two minutes, which looked
+        # like rate limiting and was not. The bid was always checked; the ask
+        # never was.
+        if (
+            held_rial > -self.max_inventory_rial
+            and sellable > 0
+            and sellable * ask_px >= self.min_quote_rial
+        ):
             quotes.append(Quote(Side.SELL, ask_px, sellable))
         return quotes
 
@@ -316,6 +453,17 @@ class MarketMaker:
                 break
         return float(self._balances.get(base, 0.0))
 
+    def _own_blocked(self, currency: str, blocked: float) -> float:
+        """How much of `blocked` is locked in quotes WE placed and will cancel.
+
+        We track our working orders per symbol, so if we have any live quote in
+        that market the blocked units are ours; otherwise they belong to an
+        order we did not place and must not be counted as sellable.
+        """
+        symbol = currency.upper() + "IRT"
+        book = self.books.get(symbol)
+        return blocked if (book and book.working) else 0.0
+
     def refresh_balances(self) -> None:
         """Snapshot wallet balances so asks are sized against real holdings.
 
@@ -330,7 +478,15 @@ class MarketMaker:
         to be free; sizing against the total is the correct view.
         """
         try:
-            self._balances = self.rest.total_balances()
+            detailed = self.rest.balances_detailed()
+            # Free units, PLUS the ones locked in our own quotes -- those are
+            # released by `cancel_working` moments before we repost. Blocked
+            # units we did NOT place stay excluded: selling them is what got
+            # 240 "Order Validation Failed" on TNSRIRT/ZROIRT/JASMYIRT.
+            self._balances = {
+                cur: free + self._own_blocked(cur, blocked)
+                for cur, (free, blocked) in detailed.items()
+            }
         except Exception:
             log.warning("could not read balances; sizing asks from tracked inventory",
                         exc_info=True)
@@ -400,9 +556,26 @@ class MakerRunner:
         self.requote_tolerance_bps = requote_tolerance_bps
         self._last_quotes: dict[str, list[Quote]] = {}
         self._balances_at = 0.0
+        self._fair_at = 0.0
+        # Global prices move on the world's clock, not our quote loop's.
+        self.fair_refresh_s = 60.0
+        # Markets the bot must never quote, whatever the wallet says. Anything
+        # held here belongs to someone else.
+        self.protected: set[str] = set()
         # clientOrderId -> symbol. The order list gives display names and a
         # null id, so this is the only way to know which market an order is.
         self._coid_symbol: dict[str, str] = {}
+        self._orders_cache: list[dict] = []
+        self._orders_at = 0.0
+        # Shared across symbols; invalidated whenever we place or cancel.
+        #
+        # 5s was still too aggressive once quoting became event driven -- the
+        # socket fires continuously, so even a shared listing every 5s tripped
+        # the limiter and produced 56 errors with zero placements. Writes
+        # invalidate it immediately, so a longer TTL only affects how quickly
+        # we notice a fill someone else caused, which is not a thing that
+        # happens to our own orders.
+        self.orders_cache_s = 20.0
         # Wallet reads are rate limited; decouple them from the quote loop.
         self.balance_refresh_s = 30.0
 
@@ -428,6 +601,10 @@ class MakerRunner:
                 return False
         return True
 
+    def latest_book(self, symbol: str):
+        """Freshest book, if a socket is feeding us one. REST otherwise."""
+        return None
+
     def _live_orders(self, symbol: str) -> list[dict]:
         """Our orders actually resting on the exchange for this market.
 
@@ -439,15 +616,34 @@ class MakerRunner:
         Returns [] on a read failure, which makes the caller cancel and repost:
         wasteful, but it can never stack.
         """
-        try:
-            raw = self.rest._get("/market/orders/list", status="open", details=2)
-        except Exception:
-            log.warning("could not list live orders for %s", symbol, exc_info=True)
-            return []
-        return [
-            o for o in raw.get("orders", [])
+        # ONE listing per sweep, shared across symbols and cached briefly.
+        #
+        # This used to fetch per symbol, which was tolerable at a 60s poll and
+        # is not once quoting is event driven: the socket fires far more often,
+        # and calling it per symbol per event earned 13 x 400 and 7 x 429 in
+        # under two minutes, so nothing could be placed at all.
+        now = time.time()
+        if now - self._orders_at >= self.orders_cache_s:
+            try:
+                raw = self.rest._get("/market/orders/list", status="open", details=2)
+                self._orders_cache = raw.get("orders", [])
+                self._orders_at = now
+            except Exception:
+                log.warning("could not list live orders", exc_info=True)
+                return []
+        live = [
+            o for o in self._orders_cache
             if self._coid_symbol.get(str(o.get("clientOrderId") or "")) == symbol
         ]
+        # Orders placed since the cache was taken are live even though the
+        # listing predates them. Without this a symbol quoted twice inside the
+        # 20s cache window cannot see its own first order and posts a second --
+        # Harmony and Raydium both ended up doubled.
+        known = {str(o.get("clientOrderId") or "") for o in live}
+        for coid in self.mm.book_for(symbol).working:
+            if coid not in known:
+                live.append({"clientOrderId": coid})
+        return live
 
     def cancel_working(self, symbol: str, live: list[dict] | None = None) -> int:
         """Pull our quotes before posting new ones.
@@ -487,6 +683,8 @@ class MakerRunner:
                                 exc_info=True)
             finally:
                 book.working.pop(coid, None)
+        if cancelled:
+            self._orders_at = 0.0
         return cancelled
 
     def held_symbols(self, min_rial: float = 50_000.0) -> list[str]:
@@ -508,6 +706,15 @@ class MakerRunner:
             symbol = cur.upper() + "IRT"
             if symbol not in self.mm.specs:
                 continue
+            # NEVER quote a market the bot did not put us into. Holdings are
+            # discovered from the wallet so a position cannot be orphaned, but
+            # the same mechanism would happily start making a market in
+            # something the ACCOUNT OWNER is trading by hand -- 478,875,002
+            # rial of PAXG sat in this wallet, placed by a person, and the
+            # maker had no way to know it was not its own.
+            if symbol in self.protected:
+                log.debug("%s is protected; not quoting it", symbol)
+                continue
             try:
                 mid = self.rest.orderbook(symbol).mid
             except Exception:
@@ -515,6 +722,50 @@ class MakerRunner:
             if units * mid >= min_rial:
                 out.append(symbol)
         return out
+
+    def refresh_fair_values(self, specs: dict) -> int:
+        """Update global fair values: global USD price x USDT/IRT.
+
+        Refreshed on its own slow clock -- global prices move on the world's
+        timescale, not our quote loop's -- and via KuCoin's all-tickers
+        endpoint, which is ONE request for every symbol rather than one per
+        symbol for a single number.
+        """
+        now = time.time()
+        if now - self._fair_at < self.fair_refresh_s:
+            return 0
+        self._fair_at = now
+
+        try:
+            fx = self.rest.orderbook("USDTIRT").mid
+        except Exception:
+            log.warning("no USDT/IRT rate; quoting off the local book alone", exc_info=True)
+            return 0
+        if fx <= 0:
+            return 0
+
+        from ..data.kucoin import KuCoinFeed, all_tickers
+
+        try:
+            tickers = all_tickers()
+        except Exception:
+            log.warning("no global tickers; quoting off the local book alone", exc_info=True)
+            return 0
+
+        mapper = KuCoinFeed()
+        updated = 0
+        for symbol, spec in specs.items():
+            tv = getattr(spec, "tradingview", None)
+            if not tv:
+                continue
+            price = tickers.get(mapper._to_kucoin_symbol(tv))
+            if not price:
+                continue
+            self.mm.set_fair(symbol, price, fx, getattr(spec, "multiplier", 1))
+            updated += 1
+        if updated:
+            log.debug("refreshed %d global fair values at fx %.0f", updated, fx)
+        return updated
 
     def sweep(self, symbols: list[str]) -> None:
         """One requote pass over every symbol.
@@ -531,6 +782,11 @@ class MakerRunner:
         if now - self._balances_at >= self.balance_refresh_s:
             self.mm.refresh_balances()
             self._balances_at = now
+        # Commitments are per sweep: the snapshot above already includes any
+        # fills from previous ones.
+        self.mm.reset_commitments()
+        # Global reference prices, on their own slow clock.
+        self.refresh_fair_values(self.mm.specs)
 
         # Quote the configured markets PLUS anything we hold. A held position
         # with no ask is a directional bet nobody chose, and it persists until
@@ -548,12 +804,14 @@ class MakerRunner:
 
     def quote_once(self, symbol: str) -> list[Quote]:
         """One requote cycle for one symbol. Returns the quotes posted."""
-        try:
-            top = self.rest.orderbook(symbol)
-        except Exception:
-            log.warning("no book for %s; leaving quotes pulled", symbol, exc_info=True)
-            self.cancel_working(symbol)
-            return []
+        top = self.latest_book(symbol)
+        if top is None:
+            try:
+                top = self.rest.orderbook(symbol)
+            except Exception:
+                log.warning("no book for %s; leaving quotes pulled", symbol, exc_info=True)
+                self.cancel_working(symbol)
+                return []
 
         quotes = self.mm.make_quotes(symbol, top)
         edge = self.mm.edge_bps(top)
@@ -628,6 +886,9 @@ class MakerRunner:
                 )
                 self.mm.book_for(symbol).working[coid] = order
                 self._coid_symbol[coid] = symbol
+                self._orders_at = 0.0
+                if q.side is Side.BUY:
+                    self.mm.commit_cash(q.notional)
                 self.mm.note_placement(1)
                 posted.append(q)
             except Exception:
@@ -638,3 +899,67 @@ class MakerRunner:
         # now suspect: shorten its life rather than trusting it a full window.
         self._balances_at = min(self._balances_at, time.time() - self.balance_refresh_s / 2)
         return posted
+
+
+class SocketMakerRunner(MakerRunner):
+    """Event-driven quoting: react to book updates, not a polling clock.
+
+    Why this matters for P&L rather than tidiness. Measured over 24h of REST
+    polling, realized round trips were -80,276 rial across 7 markets with only
+    1 profitable. That is adverse selection: a quote priced off a book we read
+    seconds ago gets filled by someone reacting to the book as it is NOW, so
+    our bid fills into a falling market and our ask into a rising one. The
+    quoted spread was never the problem; the staleness was.
+
+    A websocket removes the polling interval from that equation -- quotes are
+    repriced when the book actually moves, not when a timer says so.
+
+    What does NOT change is the exchange's 300-placements-per-10-minutes limit.
+    Reacting to every tick would blow through it instantly, so the same
+    machinery still applies: an unchanged quote is not reposted, and a
+    per-symbol cooldown bounds how often any one market can be requoted. The
+    socket improves WHEN we act, not how much we are allowed to act.
+    """
+
+    def __init__(self, cfg, maker: MarketMaker, rest, ws,
+                 requote_tolerance_bps: float = 3.0,
+                 min_requote_gap_s: float = 2.0):
+        super().__init__(cfg, maker, rest, requote_tolerance_bps=requote_tolerance_bps)
+        self.ws = ws
+        # Floor on how often a single symbol may be requoted, whatever the
+        # book does. Without it a fast-moving market would eat the whole
+        # placement budget on its own and starve every other symbol.
+        self.min_requote_gap_s = min_requote_gap_s
+        self._last_requote: dict[str, float] = {}
+        self._books: dict[str, BookTop] = {}
+        self._dirty: set[str] = set()
+
+    def on_book(self, symbol: str, top: BookTop) -> None:
+        """Websocket callback. Cheap on purpose -- it runs on the event loop.
+
+        Only marks the symbol dirty; the actual quoting is done by the worker,
+        because placing orders is blocking I/O and must never run here. Doing
+        REST calls in a websocket handler is what starved Centrifugo's 25s
+        ping and got the trend bot disconnected for 'no pong'.
+        """
+        self._books[symbol] = top
+        self._dirty.add(symbol)
+
+    def latest_book(self, symbol: str) -> BookTop | None:
+        return self._books.get(symbol)
+
+    def due(self, symbol: str, now: float | None = None) -> bool:
+        """Is this symbol both changed and past its cooldown?"""
+        if symbol not in self._dirty:
+            return False
+        now = now if now is not None else time.time()
+        return now - self._last_requote.get(symbol, 0.0) >= self.min_requote_gap_s
+
+    def take_due(self, now: float | None = None) -> list[str]:
+        """Symbols ready to requote, clearing their dirty flag."""
+        now = now if now is not None else time.time()
+        ready = [s for s in sorted(self._dirty) if self.due(s, now)]
+        for s in ready:
+            self._dirty.discard(s)
+            self._last_requote[s] = now
+        return ready

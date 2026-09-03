@@ -252,6 +252,28 @@ class NobitexREST:
             for w in data.get("wallets", [])
         }
 
+    def balances_detailed(self) -> dict[str, tuple[float, float]]:
+        """(free, blocked) per currency.
+
+        Neither number alone is right for sizing an ask. `activeBalance`
+        excludes units locked in OUR OWN resting quote, so a symbol mid-quote
+        reads as empty (ONEIRT: 1796.48944 held, 0.08944 active). But total
+        balance includes units locked in orders that have NOT been cancelled,
+        so sizing off it asks to sell stock that is not free -- TNSRIRT tried
+        to sell 38.7 against 0.63 free, and every order came back the opaque
+        "Order Validation Failed".
+
+        The caller knows which blocked units are its own and about to be
+        released, so it gets both numbers and decides.
+        """
+        data = self._get("/users/wallets/list")
+        out: dict[str, tuple[float, float]] = {}
+        for w in data.get("wallets", []):
+            total = float(w.get("balance", 0))
+            free = float(w.get("activeBalance", 0))
+            out[w["currency"].lower()] = (free, max(0.0, total - free))
+        return out
+
     def total_balances(self) -> dict[str, float]:
         """Balance per currency INCLUDING units blocked in working orders.
 
