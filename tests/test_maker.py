@@ -1131,3 +1131,50 @@ def test_a_basis_refusal_says_basis_not_inventory():
 
     runner = MakerRunner(None, mm, None)
     assert runner is not None
+
+
+def test_the_socket_cooldown_comes_from_the_requote_flag():
+    """`--requote` was wired only to the REST fallback sleep, so the socket
+    path kept its 2s default: 12 symbols x 2 sides x 300 sweeps = 7,200
+    placements per 10 minutes against a 240 budget. It burned the allowance in
+    seconds and then refused everything, asks on held inventory included."""
+    from nbtrend.live.maker import SocketMakerRunner
+
+    mm = _mm()
+    r = SocketMakerRunner(None, mm, None, None, min_requote_gap_s=60.0)
+    assert r.min_requote_gap_s == 60.0
+
+    r.on_book("AVAXIRT", _book(998_000.0, 1_002_000.0))
+    assert r.take_due(now=1000.0) == ["AVAXIRT"]
+    r.on_book("AVAXIRT", _book(998_100.0, 1_002_100.0))
+    assert r.take_due(now=1030.0) == [], "30s into a 60s cooldown"
+    assert r.take_due(now=1061.0) == ["AVAXIRT"]
+
+
+def test_a_quoting_rate_the_budget_cannot_sustain_is_rejected_at_startup():
+    """Silent strangulation is the failure mode: every log line reads like an
+    ordinary skip while nothing trades at all."""
+    mm = _mm(max_orders_per_window=240)
+    mm.symbols = [f"S{i}IRT" for i in range(12)]
+    needed_at_2s = 12 * 2 * (600.0 / 2.0)
+    assert needed_at_2s > mm.max_orders_per_window
+    sustainable = 12 * 2 * 600.0 / mm.max_orders_per_window
+    assert sustainable == pytest.approx(60.0), "12 symbols need a 60s cooldown"
+
+
+def test_the_order_listing_is_refreshed_at_the_start_of_every_sweep():
+    """A TTL cannot express "fresh when a symbol requotes". With a 60s cooldown
+    and a 20s cache the listing was always stale by then, so `_live_orders`
+    returned nothing, `cancel_working` had nothing to cancel, and the repost
+    stacked a second quote -- Ethena, Jasmy and SuperVerse all doubled."""
+    from nbtrend.live.maker import MakerRunner
+
+    class _REST:
+        def _get(self, path, **kw):
+            return {"orders": []}
+
+    r = MakerRunner(None, _mm(), _REST())
+    r._live_orders("AVAXIRT")
+    assert r._orders_at > 0, "cached after a read"
+    r.invalidate_orders_cache()
+    assert r._orders_at == 0.0, "a new sweep must re-read"

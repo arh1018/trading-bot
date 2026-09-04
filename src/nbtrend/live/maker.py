@@ -573,6 +573,8 @@ class MakerRunner:
         self.requote_tolerance_bps = requote_tolerance_bps
         self._last_quotes: dict[str, list[Quote]] = {}
         self._balances_at = 0.0
+        # Wallet reads are rate limited; decouple them from the quote loop.
+        self.balance_refresh_s = 30.0
         self._fair_at = 0.0
         # Global prices move on the world's clock, not our quote loop's.
         self.fair_refresh_s = 60.0
@@ -586,15 +588,29 @@ class MakerRunner:
         self._orders_at = 0.0
         # Shared across symbols; invalidated whenever we place or cancel.
         #
-        # 5s was still too aggressive once quoting became event driven -- the
-        # socket fires continuously, so even a shared listing every 5s tripped
-        # the limiter and produced 56 errors with zero placements. Writes
-        # invalidate it immediately, so a longer TTL only affects how quickly
-        # we notice a fill someone else caused, which is not a thing that
-        # happens to our own orders.
+        # 5s was too aggressive once quoting became event driven -- the socket
+        # fires continuously, so even a shared listing every 5s tripped the
+        # limiter. But the TTL must also never EXCEED the requote cooldown: at
+        # a 60s cooldown a 20s cache was stale by the time a symbol came round
+        # again, so `_live_orders` returned nothing, `cancel_working` had
+        # nothing to cancel, and the repost stacked a second quote on top of
+        # the first -- Ethena, Jasmy and SuperVerse all ended up doubled.
+        #
+        # Half the cooldown: fresh enough to see our own resting orders, slow
+        # enough not to hammer the endpoint.
         self.orders_cache_s = 20.0
-        # Wallet reads are rate limited; decouple them from the quote loop.
-        self.balance_refresh_s = 30.0
+
+    def invalidate_orders_cache(self) -> None:
+        """Force the next `_live_orders` to re-read from the exchange.
+
+        A TTL cannot express what is actually needed: the listing must be
+        fresh AT THE MOMENT a symbol requotes. With a 60s cooldown and a 20s
+        TTL it was always stale by then, so `_live_orders` returned nothing,
+        `cancel_working` had nothing to cancel, and the repost stacked a second
+        quote on the first -- Ethena, Jasmy and SuperVerse all doubled.
+        Refreshing once per sweep is one extra call, shared by every symbol.
+        """
+        self._orders_at = 0.0
 
     def _unchanged(self, symbol: str, quotes: list[Quote]) -> bool:
         """True when the live quotes already match what we want to post.
@@ -802,6 +818,9 @@ class MakerRunner:
         # Commitments are per sweep: the snapshot above already includes any
         # fills from previous ones.
         self.mm.reset_commitments()
+        # And the order listing must be fresh for THIS sweep, or a repost
+        # cannot see the quote it is meant to replace.
+        self.invalidate_orders_cache()
         # Global reference prices, on their own slow clock.
         self.refresh_fair_values(self.mm.specs)
 
@@ -968,6 +987,17 @@ class SocketMakerRunner(MakerRunner):
         # placement budget on its own and starve every other symbol.
         self.min_requote_gap_s = min_requote_gap_s
         self._last_requote: dict[str, float] = {}
+        needed = len(maker.symbols) * 2 * (600.0 / max(1.0, min_requote_gap_s))
+        if needed > maker.max_orders_per_window:
+            log.error(
+                "quoting %d symbols every %.0fs needs %.0f placements/10min but the "
+                "budget is %d -- the allowance will be spent in the first sweeps and "
+                "every later quote refused, including asks on held inventory. "
+                "Raise --requote to at least %.0fs or cut symbols.",
+                len(maker.symbols), min_requote_gap_s, needed,
+                maker.max_orders_per_window,
+                len(maker.symbols) * 2 * 600.0 / maker.max_orders_per_window,
+            )
         self._books: dict[str, BookTop] = {}
         self._dirty: set[str] = set()
 

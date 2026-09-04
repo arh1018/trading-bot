@@ -278,7 +278,12 @@ async def _socket_loop(cfg, mm, api, symbols, deadline, fallback_s: float,
     from .live.maker import SocketMakerRunner
 
     ws = NobitexWS(cfg.ws_url)
-    runner = SocketMakerRunner(cfg, mm, api, ws)
+    # `--requote` is the per-symbol cooldown, NOT just the REST fallback sleep.
+    # It was only wired to the fallback, so the socket path used its 2s default
+    # and asked for 12 x 2 x (600/2) = 7,200 placements per 10 minutes against a
+    # 240 budget -- it burned the whole allowance in seconds, then refused every
+    # quote including the asks that sell held inventory.
+    runner = SocketMakerRunner(cfg, mm, api, ws, min_requote_gap_s=fallback_s)
     runner.protected = set(protected or ())
 
     def _handler(symbol: str):
