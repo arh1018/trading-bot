@@ -101,7 +101,7 @@ class MarketMaker:
         min_cash_rial: float = 0.0,
         max_basis: float = 0.02,
         fair_weight: float = 0.5,
-        max_orders_per_window: int = 150,
+        max_orders_per_window: int = 240,
         dry_run: bool = True,
     ):
         self.rest = rest
@@ -133,8 +133,15 @@ class MarketMaker:
         self.fair_weight = fair_weight
         self.dry_run = dry_run
 
-        # Half the exchange budget by default, so this can never starve
-        # whatever else runs on the account.
+        # Nobitex allows 300 placements per 10 minutes. This was 150 to leave
+        # room for the trend runner sharing the account -- that runner is gone,
+        # and the stale reservation silently strangled the maker: 12 symbols
+        # two-sided at a 60s requote needs 240, so the allowance was spent in
+        # the first sweeps and then refused everything, 2,120 times, with ZERO
+        # successful placements. Held-inventory asks were refused along with
+        # the rest, which is why stranded coins never sold.
+        #
+        # 240 leaves 60 for manual intervention and cancels.
         self.max_orders_per_window = max_orders_per_window
         self._placements: list[float] = []
 
@@ -859,7 +866,17 @@ class MakerRunner:
             # "edge 44.1 bps below the 8.0 bps floor" -- self-contradictory,
             # and it sent the investigation to the wrong place while the real
             # cause (no sellable inventory) went unnoticed.
-            if edge < self.mm.min_edge_bps:
+            drift = self.mm.basis(symbol, top)
+            if drift is not None and abs(drift) > self.mm.max_basis:
+                # Checked FIRST: a dislocated market is refused before the
+                # inventory question is even asked, so blaming inventory here
+                # sent an investigation chasing a phantom stranding bug while
+                # ONEIRT sat +8.74% from global fair, working as designed.
+                reason = (
+                    f"local mid is {drift * 100:+.2f}% from global fair "
+                    f"(limit {self.mm.max_basis * 100:.1f}%)"
+                )
+            elif edge < self.mm.min_edge_bps:
                 reason = f"edge {edge:.1f} bps under the {self.mm.min_edge_bps:.1f} bps floor"
             elif self.mm.cash_room() <= 0:
                 reason = "no cash above the reserve, and nothing sellable"
@@ -873,7 +890,17 @@ class MakerRunner:
             return []
 
         if not self.mm.can_place(len(quotes)):
-            log.warning("%s: order budget exhausted; skipping this requote", symbol)
+            # Loud, and says what to change. Quoted at a rate the budget cannot
+            # sustain, the maker stops trading entirely while every log line
+            # still reads like an ordinary skip.
+            log.error(
+                "%s: ORDER BUDGET EXHAUSTED (%d/%d used in the last 10min). "
+                "Quoting %d symbols two-sided every %.0fs needs %.0f placements; "
+                "reduce symbols or lengthen --requote.",
+                symbol, len(self.mm._placements), self.mm.max_orders_per_window,
+                len(self.mm.symbols), self.mm.requote_s,
+                len(self.mm.symbols) * 2 * (600.0 / max(1.0, self.mm.requote_s)),
+            )
             return []
 
         spec = self.mm.specs[symbol]

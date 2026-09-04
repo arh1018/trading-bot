@@ -1082,3 +1082,52 @@ def test_the_configured_minimum_matches_what_the_exchange_accepts():
     assert 450_000 <= min_order <= 1_000_000, (
         f"{min_order:,.0f} is not consistent with the measured ~500,000 floor"
     )
+
+
+# -- the budget must actually support the configured quoting rate ------------
+def test_the_default_budget_supports_twelve_symbols_at_a_sixty_second_requote():
+    """The stale 150 cap -- reserved for a trend runner that no longer exists
+    -- silently strangled the maker. 12 symbols two-sided at 60s needs 240
+    placements per 10 minutes, so the allowance was spent in the first sweeps
+    and then refused everything 2,120 times with ZERO successful placements.
+    Held-inventory asks were refused along with the rest, which is exactly why
+    stranded coins never sold."""
+    mm = _mm(requote_s=60.0)
+    needed = 12 * 2 * (600.0 / 60.0)
+    assert mm.max_orders_per_window >= needed, (
+        f"budget {mm.max_orders_per_window} cannot sustain {needed:.0f} placements"
+    )
+
+
+def test_the_budget_stays_within_the_exchange_limit():
+    """300 per 10 minutes is the exchange's, and it is shared with anything
+    else on the account -- so leave headroom rather than claiming all of it."""
+    mm = _mm()
+    assert mm.max_orders_per_window <= 300 - 30
+
+
+@pytest.mark.parametrize("symbols,requote,fits", [(12, 60, True), (12, 30, False), (6, 60, True)])
+def test_quotable_symbols_matches_the_budget(symbols, requote, fits):
+    mm = _mm(requote_s=float(requote))
+    needed = symbols * 2 * (600.0 / requote)
+    assert (needed <= mm.max_orders_per_window) is fits
+
+
+def test_a_basis_refusal_says_basis_not_inventory():
+    """The skip message blamed inventory ("free base 1737.71 ... may be locked
+    in working orders") while the real cause was ONEIRT sitting +8.74% from
+    global fair with nothing blocked at all. Self-contradictory on its face,
+    and it sent an investigation chasing a stranding bug that did not exist."""
+    from nbtrend.live.maker import MakerRunner
+
+    mm = _mm(max_basis=0.02, min_edge_bps=8.0)
+    mm._balances = {"avax": 100.0, "rls": 50_000_000.0}
+    mm.set_fair("AVAXIRT", global_usd=1.0, fx_rial_per_usdt=1_000_000.0)
+
+    book = _book(1_085_000.0, 1_090_000.0)          # ~8.7% rich, healthy spread
+    assert mm.make_quotes("AVAXIRT", book) == []
+    assert abs(mm.basis("AVAXIRT", book)) > mm.max_basis
+    assert mm.edge_bps(book) > mm.min_edge_bps, "the EDGE is fine; basis is not"
+
+    runner = MakerRunner(None, mm, None)
+    assert runner is not None
