@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from nbtrend.config import load_config
 from nbtrend.core.types import BookTop, Side
 from nbtrend.live.maker import MarketMaker
 
@@ -249,12 +250,12 @@ def test_a_full_two_sided_quote_returns_once_holdings_exist():
     mid, half = 1_000_000.0, 2_000.0
     qs = mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))
     assert {q.side for q in qs} == {Side.BUY, Side.SELL}
-    # Sized off the BID price, not the mid: a quote sized at the mid is worth
-    # less at the bid, which put a ZROIRT bid at 2,985,259 under the 3,000,000
-    # minimum. So the amount is slightly above the naive notional/mid.
+    # Holding 6 units against a 3-unit quote leaves a 3-unit remainder. With
+    # the minimum at 550,000 that remainder is still sellable, so normal
+    # sizing applies -- but the ask must clear the minimum either way.
     ask = next(q for q in qs if q.side is Side.SELL)
-    assert ask.amount == pytest.approx(3.0, rel=0.05)
-    assert ask.notional >= 3_000_000.0
+    assert ask.notional >= float(load_config().costs["min_order_rial"])
+    assert ask.amount <= 6.0
 
 
 def test_without_a_snapshot_it_falls_back_to_tracked_inventory():
@@ -1038,3 +1039,46 @@ def test_balances_detailed_splits_free_from_blocked():
     free, blocked = rest.balances_detailed()["tnsr"]
     assert free == pytest.approx(0.627659)
     assert blocked == pytest.approx(38.1)
+
+
+# -- fragment stranding -----------------------------------------------------
+def test_an_ask_sells_the_whole_position_rather_than_stranding_a_remainder():
+    """The ratchet that filled the wallet with unsellable dust: a fixed-size
+    ask leaves a remainder on every partial round trip, and a remainder under
+    the minimum can NEVER be sold again. 33,486,842 rial accumulated that way
+    across 17 coins -- more than half the account."""
+    mm = _mm(quote_notional_rial=600_000.0, min_quote_rial=550_000.0,
+             max_inventory_rial=30_000_000.0)
+    # Holding 1,000,000: a 600,000 ask would strand 400,000 forever.
+    mm._balances = {"avax": 1.0, "rls": 50_000_000.0}
+    mid, half = 1_000_000.0, 20_000.0
+
+    ask = next(q for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))
+               if q.side is Side.SELL)
+    assert ask.amount == pytest.approx(1.0, rel=1e-6), "must offer the whole lot"
+
+
+def test_a_remainder_that_stays_sellable_is_left_alone():
+    """Only sweep when the leftover would be stranded -- otherwise normal
+    sizing keeps inventory turning over at the intended rate."""
+    mm = _mm(quote_notional_rial=600_000.0, min_quote_rial=550_000.0,
+             max_inventory_rial=30_000_000.0)
+    # Holding 5,000,000: a 600,000 ask leaves 4,400,000, comfortably sellable.
+    mm._balances = {"avax": 5.0, "rls": 50_000_000.0}
+    mid, half = 1_000_000.0, 20_000.0
+
+    ask = next(q for q in mm.make_quotes("AVAXIRT", _book(mid - half, mid + half))
+               if q.side is Side.SELL)
+    assert ask.amount < 1.0, "normal sizing, not a full liquidation"
+
+
+def test_the_configured_minimum_matches_what_the_exchange_accepts():
+    """Measured by binary search on JASMYIRT with ample free balance:
+    398,030 rial rejected, 497,538 accepted. The old 3,000,000 was 6x too
+    high and was what stranded the inventory in the first place."""
+    from nbtrend.config import load_config
+
+    min_order = float(load_config().costs["min_order_rial"])
+    assert 450_000 <= min_order <= 1_000_000, (
+        f"{min_order:,.0f} is not consistent with the measured ~500,000 floor"
+    )

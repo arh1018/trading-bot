@@ -381,3 +381,23 @@ def test_oco_rejects_an_invalid_leverage_step():
         rest.add_oco_order("btc", "rls", Side.SELL, 0.01, price=110,
                            stop_price=90, stop_limit_price=89, leverage=2.3)
     assert fake.calls == []
+
+
+def test_add_order_returns_the_client_order_id_it_sent():
+    """The response does not always echo it, and it is the only handle that
+    reliably cancels on this exchange. Losing it means the order cannot be
+    cancelled, its balance stays locked, and every later ask tries to sell
+    committed stock -- 5,380 "Order Validation Failed" in one short run."""
+    from nbtrend.data.nobitex_rest import NobitexREST
+
+    rest = object.__new__(NobitexREST)
+    rest._post = lambda path, payload: {
+        "status": "ok",
+        # No clientOrderId echoed back, as the live API sometimes does.
+        "order": {"id": 42, "type": "buy", "srcCurrency": "xlm", "dstCurrency": "rls",
+                  "price": "400000", "amount": "3", "status": "Active",
+                  "matchedAmount": 0},
+    }
+    order = rest.add_order("xlm", "rls", Side.BUY, 3.0, price=400_000,
+                           client_order_id="mkr-abc123")
+    assert order.client_order_id == "mkr-abc123"

@@ -335,7 +335,18 @@ class NobitexREST:
             payload["clientOrderId"] = client_order_id[:32]
 
         data = self._post("/market/orders/add", payload)
-        return _parse_order(data["order"], f"{src.upper()}{'IRT' if dst == 'rls' else dst.upper()}")
+        order = _parse_order(
+            data["order"], f"{src.upper()}{'IRT' if dst == 'rls' else dst.upper()}"
+        )
+        # Carry the clientOrderId back. The response does not always echo it,
+        # and it is the ONLY handle that reliably cancels on this exchange --
+        # without it the caller gets "Both id and clientOrderId cannot be
+        # null", the order never cancels, its balance stays locked, and every
+        # later ask tries to sell stock that is still committed. That produced
+        # 5,380 "Order Validation Failed" in a single short run.
+        if client_order_id and not order.client_order_id:
+            order.client_order_id = client_order_id[:32]
+        return order
 
     def order_status(
         self, order_id: int | None = None, client_order_id: str | None = None

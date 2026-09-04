@@ -426,10 +426,20 @@ class MarketMaker:
         )
         # The ask must clear the exchange minimum too. Capping it at what we
         # HOLD is not enough: holding 0.10045944 HOLO produced a 13,845 rial
-        # ask against a 3,000,000 minimum, rejected "Order Validation Failed"
-        # on every single sweep -- 47 times in under two minutes, which looked
-        # like rate limiting and was not. The bid was always checked; the ask
-        # never was.
+        # ask against the minimum, rejected "Order Validation Failed" on every
+        # sweep -- 47 times in under two minutes. The bid was always checked;
+        # the ask never was.
+        #
+        # SELL THE WHOLE FRAGMENT. Quoting a fixed size leaves a remainder
+        # behind on every partial round trip, and a remainder under the
+        # minimum can never be sold again -- 33,486,842 rial accumulated that
+        # way across 17 coins, more than half the account. If what remains
+        # after a normal-sized ask would be unsellable, offer the lot instead.
+        free = max(0.0, self.available_base(symbol))
+        remainder = free - sellable
+        if 0 < remainder * ask_px < self.min_quote_rial:
+            sellable = round_to_step(free, spec.amount_step)
+
         if (
             held_rial > -self.max_inventory_rial
             and sellable > 0

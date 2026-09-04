@@ -138,21 +138,29 @@ def test_gross_cap_reserves_cash_for_fees():
 
 def test_position_limit_is_derived_from_equity():
     """A wide universe on a small account otherwise places no orders at all:
-    every position falls under the 3,000,000 rial minimum and is skipped."""
+    every position falls under the exchange minimum and is skipped.
+
+    Derived from config rather than a pinned count -- the minimum was measured
+    down from 3,000,000 to 550,000 and a hardcoded "3 positions" then asserted
+    the wrong arithmetic rather than the behaviour.
+    """
     from nbtrend.live.runner import LiveRunner, SymbolState
 
     cfg = load_config()
     runner = object.__new__(LiveRunner)
     runner.cfg = cfg
+    min_order = float(cfg.costs["min_order_rial"])
 
     specs = cfg.universe[:10]
     states = [SymbolState(spec=s, target_weight=0.3, score=0.9 - i * 0.05)
               for i, s in enumerate(specs)]
 
-    # 10M rial / 3M minimum -> 3 fundable positions.
-    runner._limit_positions(states, equity=10_000_000)
+    equity = 10_000_000.0
+    runner._limit_positions(states, equity=equity)
     funded = [s for s in states if s.target_weight != 0.0]
-    assert len(funded) == 3
+    assert len(funded) == min(len(specs), int(equity // min_order))
+    for st in funded:
+        assert abs(st.target_weight) * equity >= min_order
 
 
 def test_position_limit_keeps_the_highest_conviction_names():
@@ -189,8 +197,12 @@ def test_selection_declines_rather_than_oversizing():
     specs = cfg.universe[:5]
     states = [SymbolState(spec=s, target_weight=0.3, score=0.9) for s in specs]
 
-    # 0.3 x 7,000,000 = 2.1M, under the 3M minimum.
-    runner._limit_positions(states, equity=7_000_000)
+    # Equity chosen so 0.3 of it lands just UNDER the configured minimum,
+    # rather than a constant that silently stops testing anything when the
+    # minimum moves (it went 3,000,000 -> 550,000).
+    min_order = float(cfg.costs["min_order_rial"])
+    equity = (min_order / 0.3) * 0.7
+    runner._limit_positions(states, equity=equity)
     assert all(s.target_weight == 0.0 for s in states)
 
 
@@ -445,10 +457,15 @@ def test_drop_unfundable_leaves_incumbents_alone():
 
     incumbent, newcomer = cfg.universe[0], cfg.universe[1]
     runner._book = {incumbent.nobitex}
-    equity = 10_000_000
+    # Weights scaled to the CONFIGURED minimum: both sit under it, so the
+    # incumbent is kept only because it is already held.
+    min_order = float(cfg.costs["min_order_rial"])
+    equity = 10_000_000.0
+    held_w = (min_order * 0.85) / equity
+    new_w = (min_order * 0.33) / equity
     states = [
-        SymbolState(spec=incumbent, target_weight=0.254, score=0.87),  # 2,540,000
-        SymbolState(spec=newcomer, target_weight=0.10, score=0.80),    # 1,000,000
+        SymbolState(spec=incumbent, target_weight=held_w, score=0.87),
+        SymbolState(spec=newcomer, target_weight=new_w, score=0.80),
     ]
 
     runner._drop_unfundable(states, equity=equity)

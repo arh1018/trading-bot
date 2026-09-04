@@ -207,7 +207,13 @@ costs:
   taker_fee_usdt: 0.0009
   # Modelled slippage as a fraction of price, applied on top of the fee.
   slippage: 0.0010
-  min_order_rial: 3000000      # exchange minimum for IRT markets (300k Toman)
+  # MEASURED against the live exchange, not assumed. Binary-searched on
+  # JASMYIRT with ample free balance: 398,030 rial rejected, 497,538 accepted.
+  # The old 3,000,000 was 6x too high and was the direct cause of stranded
+  # inventory -- a position that fell to 2.9M could never be sold again, and
+  # 33,486,842 rial accumulated that way across 17 coins.
+  # A little headroom above 500,000 so rounding cannot drop under it.
+  min_order_rial: 550000
 
   # Margin borrow cost. Nobitex charges positionFeeRate as a DAILY renewal fee
   # on the delegated (borrowed) amount -- 0.05%/day on this account, which is
