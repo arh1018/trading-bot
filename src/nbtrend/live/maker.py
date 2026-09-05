@@ -97,7 +97,7 @@ class MarketMaker:
         max_inventory_rial: float = 15_000_000.0,
         requote_s: float = 30.0,
         inside_touch: float = 0.9,
-        min_quote_rial: float = 3_000_000.0,
+        min_quote_rial: float = 550_000.0,
         min_cash_rial: float = 0.0,
         max_basis: float = 0.02,
         fair_weight: float = 0.5,
@@ -116,6 +116,10 @@ class MarketMaker:
         # Only ever narrows toward the fee floor, never through it.
         self.inside_touch = inside_touch
         # Exchange minimum: a trimmed quote below this is rejected anyway.
+        # MEASURED, not assumed -- 398,030 rejected and 497,538 accepted on
+        # JASMYIRT. The caller passes costs.min_order_rial; this default only
+        # covers the pure-logic tests. It read 3,000,000 for a long time, which
+        # silently stranded every position worth less than that.
         self.min_quote_rial = min_quote_rial
         # Rial the book must keep unspent. PER-SYMBOL caps do not bound the
         # PORTFOLIO: 12 symbols x 9,000,000 permits 108,000,000 of buying
@@ -901,10 +905,22 @@ class MakerRunner:
                 reason = "no cash above the reserve, and nothing sellable"
             else:
                 free = self.mm.available_base(symbol)
-                reason = (
-                    f"edge {edge:.1f} bps is fine, but nothing to quote: free base "
-                    f"{free:.8f} (inventory may be locked in working orders)"
-                )
+                book = self.mm.book_for(symbol)
+                held = free * book.mid if book.mid else 0.0
+                if 0 < held < self.mm.min_quote_rial:
+                    # Name the real cause. The old wording blamed "locked in
+                    # working orders" for what was nearly always a holding
+                    # sitting under the ask minimum, and cost an investigation.
+                    reason = (
+                        f"edge {edge:.1f} bps is fine, but the {held:,.0f} rial held "
+                        f"is under the {self.mm.min_quote_rial:,.0f} ask minimum "
+                        f"-- cannot offer it"
+                    )
+                else:
+                    reason = (
+                        f"edge {edge:.1f} bps is fine, but nothing to quote: free base "
+                        f"{free:.8f} (inventory may be locked in working orders)"
+                    )
             log.info("%s: not quoting -- %s", symbol, reason)
             return []
 

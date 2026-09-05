@@ -1178,3 +1178,28 @@ def test_the_order_listing_is_refreshed_at_the_start_of_every_sweep():
     assert r._orders_at > 0, "cached after a read"
     r.invalidate_orders_cache()
     assert r._orders_at == 0.0, "a new sweep must re-read"
+
+
+def test_ask_minimum_comes_from_config_not_a_hardcoded_default():
+    """A holding worth more than the exchange minimum must get an ask.
+
+    The maker carried its own 3,000,000 default while the measured minimum
+    (550,000) sat in costs.min_order_rial unused, because the CLI never passed
+    it. Everything between the two was refused an ask -- sellable on the
+    exchange, blocked by us -- so buys outnumbered sells better than two to one
+    and inventory only accumulated.
+    """
+    from nbtrend.config import load_config
+
+    cfg = load_config()
+    configured = float(cfg.costs["min_order_rial"])
+    assert configured < 3_000_000, "config no longer holds the measured minimum"
+
+    # The default must not silently exceed what the config declares.
+    import inspect
+
+    default = inspect.signature(MarketMaker.__init__).parameters["min_quote_rial"].default
+    assert default <= configured, (
+        f"MarketMaker defaults min_quote_rial to {default:,.0f}, above the "
+        f"configured {configured:,.0f} -- holdings between them get no ask"
+    )

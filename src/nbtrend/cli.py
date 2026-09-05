@@ -470,6 +470,11 @@ def make(
     min_cash: float = typer.Option(
         0.0, help="Rial to keep unspent across the whole book (portfolio floor)."
     ),
+    min_quote: float = typer.Option(
+        0.0,
+        help="Smallest quote the exchange accepts, in rial. 0 reads "
+             "costs.min_order_rial from the config, which is the measured value.",
+    ),
     live: bool = typer.Option(False, "--live", help="Place real orders (default: dry run)."),
     socket: bool = typer.Option(
         True, help="Drive quoting from the websocket book instead of polling."
@@ -497,6 +502,14 @@ def make(
     maker_fee = float(cfg.costs.get("maker_fee_irt", cfg.costs["maker_fee"]))
     with NobitexREST(cfg.rest_url, cfg.creds.api_token,
                 api_key=cfg.creds.api_key, api_secret=cfg.creds.api_secret) as api:
+        # THE EXCHANGE MINIMUM HAS ONE SOURCE. It was measured against the live
+        # book and written to costs.min_order_rial; the maker used to carry its
+        # own 3,000,000 default that nothing ever overwrote, so the measured
+        # 550,000 sat in the config being ignored. Every holding worth between
+        # the two was refused an ask -- sellable on Nobitex, blocked by us --
+        # which is why buys outnumbered sells better than two to one.
+        min_quote_rial = min_quote or float(cfg.costs.get("min_order_rial", 550_000))
+
         mm = MarketMaker(
             api, specs, wanted,
             maker_fee=maker_fee,
@@ -504,6 +517,7 @@ def make(
             quote_notional_rial=notional,
             max_inventory_rial=max_inventory,
             min_cash_rial=min_cash,
+            min_quote_rial=min_quote_rial,
             requote_s=requote,
             dry_run=not live,
         )
@@ -518,6 +532,8 @@ def make(
             f"floor {min_edge_bps:.1f} bps above it\n"
             f"budget supports {mm.max_quotable_symbols():.1f} symbols at {requote:.0f}s requote\n"
             f"cash floor {min_cash:,.0f} rial; inventory cap {max_inventory:,.0f}/symbol\n"
+            f"min quote {min_quote_rial:,.0f} rial "
+            f"({'--min-quote' if min_quote else 'costs.min_order_rial'})\n"
         )
         if len(wanted) > mm.max_quotable_symbols():
             console.print(
