@@ -1144,16 +1144,40 @@ class SocketMakerRunner(MakerRunner):
         return self._books.get(symbol)
 
     def due(self, symbol: str, now: float | None = None) -> bool:
-        """Is this symbol both changed and past its cooldown?"""
-        if symbol not in self._dirty:
-            return False
+        """Is this symbol past its cooldown and in need of a look?
+
+        Dirty means the book moved. But a symbol with orders resting on the
+        exchange needs a look whether or not a tick arrived: our quote can stop
+        being valid without the book moving under it at all -- the spread
+        compresses past the edge gate, inventory fills up, the basis drifts --
+        and in every one of those cases `make_quotes` returns nothing, so the
+        old order should be CANCELLED rather than left to rest.
+
+        Waiting on `_dirty` alone left exactly that: every symbol failed the
+        edge gate as spreads compressed, no ticks were arriving on the quiet
+        ones, and stale quotes sat at prices the maker would no longer post --
+        1M_PEPE, RAY, SUPER, TNSR and PYTH all resting behind the touch with
+        nothing scheduled to revisit them.
+        """
         now = now if now is not None else time.time()
-        return now - self._last_requote.get(symbol, 0.0) >= self.min_requote_gap_s
+        if now - self._last_requote.get(symbol, 0.0) < self.min_requote_gap_s:
+            return False
+        if symbol in self._dirty:
+            return True
+        # Nothing resting means nothing to correct; wait for a real tick.
+        return bool(self.mm.book_for(symbol).working)
 
     def take_due(self, now: float | None = None) -> list[str]:
-        """Symbols ready to requote, clearing their dirty flag."""
+        """Symbols ready to requote, clearing their dirty flag.
+
+        Considers every symbol we quote, not just the dirty ones: `due` also
+        returns True for a symbol with orders resting on the exchange, which
+        must be revisited even when no tick has arrived to mark it dirty.
+        Iterating `_dirty` alone made that check unreachable.
+        """
         now = now if now is not None else time.time()
-        ready = [s for s in sorted(self._dirty) if self.due(s, now)]
+        candidates = set(self._dirty) | set(self.mm.books)
+        ready = [s for s in sorted(candidates) if self.due(s, now)]
         for s in ready:
             self._dirty.discard(s)
             self._last_requote[s] = now

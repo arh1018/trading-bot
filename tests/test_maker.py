@@ -1473,3 +1473,31 @@ def test_a_book_too_thin_to_pay_the_fee_is_not_quoted_at_the_touch():
         assert not (bid.price > book.best_bid and ask.price < book.best_ask), (
             "quoted at the touch on a book that cannot pay for it"
         )
+
+
+def test_a_symbol_with_resting_orders_is_revisited_without_a_tick():
+    """A quote can stop being valid without the book moving under it.
+
+    Quoting was driven entirely by `_dirty`, which only a websocket tick sets.
+    When spreads compressed past the edge gate every symbol stopped quoting,
+    the quiet ones stopped ticking, and their stale orders rested at prices the
+    maker would no longer post -- 1M_PEPE, RAY, SUPER, TNSR and PYTH all behind
+    the touch with nothing scheduled to revisit them. `make_quotes` returning
+    nothing has to mean CANCEL, which needs the symbol to come round again.
+    """
+    from nbtrend.live.maker import MarketMaker, SocketMakerRunner
+
+    specs = {"RAYIRT": _Spec()}
+    mm = MarketMaker(None, specs, ["RAYIRT"], maker_fee=0.0008, dry_run=True)
+    runner = SocketMakerRunner(None, mm, None, None, min_requote_gap_s=1.0)
+
+    # Never ticked, nothing resting: leave it alone.
+    assert runner.take_due(now=1_000.0) == []
+
+    # Orders resting on the exchange: due, tick or no tick.
+    mm.book_for("RAYIRT").working = {"coid": object()}
+    assert runner.take_due(now=2_000.0) == ["RAYIRT"]
+
+    # Cooldown still applies -- this is not a busy loop.
+    assert runner.take_due(now=2_000.5) == []
+    assert runner.take_due(now=2_002.0) == ["RAYIRT"]
