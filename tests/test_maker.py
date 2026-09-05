@@ -1203,3 +1203,37 @@ def test_ask_minimum_comes_from_config_not_a_hardcoded_default():
         f"MarketMaker defaults min_quote_rial to {default:,.0f}, above the "
         f"configured {configured:,.0f} -- holdings between them get no ask"
     )
+
+
+def test_the_under_minimum_skip_message_can_actually_be_built(caplog):
+    """The skip path must not crash on the object it reports about.
+
+    This branch reached for `book_for(symbol).mid`, but `book_for` returns a
+    SymbolBook -- our own quoting state, which carries no prices. The maker
+    died with AttributeError the first time a holding fell under the ask
+    minimum, roughly forty minutes after launch, and every test still passed
+    because nothing drove this branch. The price lives on the BookTop.
+    """
+    import logging
+
+    from nbtrend.live.maker import MarketMaker
+
+    specs = {"AVAXIRT": _Spec()}
+    mm = MarketMaker(
+        None, specs, ["AVAXIRT"], maker_fee=0.0008,
+        min_quote_rial=550_000.0, dry_run=True,
+    )
+    # A wide spread, so the edge gate passes. Cash is above the reserve but
+    # under one quote's notional, so no bid; the holding is worth ~100,000
+    # rial, under the ask minimum, so no ask either. That combination is the
+    # branch -- edge is fine, yet there is nothing to post.
+    mm._balances = {"avax": 0.1, "rls": 500_000.0}
+    books = {"AVAXIRT": _book(990_000.0, 1_010_000.0)}
+
+    with caplog.at_level(logging.INFO):
+        quotes = _runner(mm, books).quote_once("AVAXIRT")
+
+    assert quotes == []
+    assert "ask minimum" in caplog.text, (
+        "expected the skip to name the ask minimum, got: " + caplog.text
+    )

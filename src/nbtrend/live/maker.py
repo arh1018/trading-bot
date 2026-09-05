@@ -905,8 +905,9 @@ class MakerRunner:
                 reason = "no cash above the reserve, and nothing sellable"
             else:
                 free = self.mm.available_base(symbol)
-                book = self.mm.book_for(symbol)
-                held = free * book.mid if book.mid else 0.0
+                # `top` is the BookTop for this sweep. `book_for` returns our
+                # own SymbolBook -- quoting state, no prices on it at all.
+                held = free * top.mid if top.mid else 0.0
                 if 0 < held < self.mm.min_quote_rial:
                     # Name the real cause. The old wording blamed "locked in
                     # working orders" for what was nearly always a holding
