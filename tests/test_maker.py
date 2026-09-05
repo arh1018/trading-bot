@@ -1406,3 +1406,70 @@ def test_a_resting_quote_behind_the_touch_is_reposted():
     fresh = [Quote(Side.BUY, 1_857_700.0, 0.8), Quote(Side.SELL, 1_882_100.0, 0.8)]
     runner._last_quotes["RAYIRT"] = fresh
     assert runner._unchanged("RAYIRT", fresh) is True
+
+
+def test_a_wide_book_is_quoted_at_the_touch_on_both_sides():
+    """Being in front is not the same as claiming the spread.
+
+    The first version of the touch clamp only ever tightened toward the mid, so
+    a side that skew had already pulled well inside stayed there. RAYIRT, with
+    143 bps of spread, asked 1,882,200 when one tick inside the best ask was
+    1,886,000 -- in front either way, and 20 bps better for the same queue
+    position. Each side now moves TO the touch, in or out.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 100.0
+    mm = MarketMaker(None, {"RAYIRT": spec}, ["RAYIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, quote_notional_rial=1_500_000.0,
+                     max_inventory_rial=5_000_000.0,
+                     min_quote_rial=550_000.0, dry_run=True)
+    mm._balances = {"ray": 0.768, "rls": 50_000_000.0}   # ~1,438,723 held, skew +0.29
+
+    book = _book(1_859_310.0, 1_886_100.0)               # 143 bps
+    quotes = mm.make_quotes("RAYIRT", book)
+    bid = next(q for q in quotes if q.side.name == "BUY")
+    ask = next(q for q in quotes if q.side.name == "SELL")
+
+    # One tick inside, snapped to the tick grid -- the book's best prices are
+    # not themselves aligned, so "touch + tick" is the next aligned price.
+    assert book.best_bid < bid.price <= book.best_bid + 100.0, (
+        f"bid {bid.price:,.0f} not one tick inside {book.best_bid:,.0f}"
+    )
+    assert book.best_ask - 100.0 <= ask.price < book.best_ask, (
+        f"ask {ask.price:,.0f} not one tick inside {book.best_ask:,.0f}"
+    )
+    # Skew must not have cost us the far side of a spread this wide.
+    width = (ask.price - bid.price) / book.mid * 1e4
+    assert width > 140.0, f"only claimed {width:.1f} of 143 bps"
+
+
+def test_a_book_too_thin_to_pay_the_fee_is_not_quoted_at_the_touch():
+    """Claiming the spread must never mean quoting inside the fee.
+
+    ENAIRT ran a 1.6 bps spread against a 24 bps requirement. Being first in
+    that queue means buying at a price we cannot sell above -- the queue is
+    worth nothing if the round trip loses money.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 10.0
+    mm = MarketMaker(None, {"ENAIRT": spec}, ["ENAIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, quote_notional_rial=1_500_000.0,
+                     max_inventory_rial=5_000_000.0,
+                     min_quote_rial=550_000.0, dry_run=True)
+    mm._balances = {"ena": 4.1, "rls": 50_000_000.0}
+
+    book = _book(367_630.0, 367_690.0)                   # 1.6 bps
+    quotes = mm.make_quotes("ENAIRT", book)
+
+    if len(quotes) == 2:
+        bid = next(q for q in quotes if q.side.name == "BUY")
+        ask = next(q for q in quotes if q.side.name == "SELL")
+        width = (ask.price - bid.price) / book.mid * 1e4
+        assert width >= 24.0, f"quoted {width:.1f} bps, inside the fee"
+        assert not (bid.price > book.best_bid and ask.price < book.best_ask), (
+            "quoted at the touch on a book that cannot pay for it"
+        )

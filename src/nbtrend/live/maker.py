@@ -410,11 +410,26 @@ class MarketMaker:
         if tick_for_touch > 0:
             want_bid = book.best_bid + tick_for_touch
             want_ask = book.best_ask - tick_for_touch
-            # Only tighten -- never widen a side back out to the touch, which
-            # would undo the skew the inventory asked for.
-            new_bid = max(bid_px, want_bid) if bid_px < want_bid else bid_px
-            new_ask = min(ask_px, want_ask) if ask_px > want_ask else ask_px
-            # Keep the improvement only if the pair still clears breakeven.
+
+            # CLAIM THE WHOLE SPREAD, not just enough of it to be in front.
+            #
+            # An earlier version only ever tightened toward the mid, which left
+            # money on the table on a wide book: RAYIRT, 143 bps of spread,
+            # asked 1,882,200 when one tick inside the best ask was 1,886,000 --
+            # already in front either way, and 20 bps better for the same queue
+            # position. Skew had pulled the centre down and nothing pulled the
+            # far side back out.
+            #
+            # So each side moves TO one tick inside the touch, in or out. Skew
+            # still governs which side gets suppressed entirely when inventory
+            # runs to the cap, and the fee floor below still governs whether
+            # the pair may be quoted at all -- this only decides where a side
+            # sits once both have been allowed.
+            new_bid = min(max(bid_px, want_bid), want_bid)
+            new_ask = max(min(ask_px, want_ask), want_ask)
+
+            # Keep it only if the pair still clears breakeven. On a book too
+            # thin to pay for both sides at the touch, the skewed prices stand.
             if new_ask - new_bid >= target * ((new_ask + new_bid) / 2.0):
                 bid_px, ask_px = new_bid, new_ask
 
@@ -719,12 +734,18 @@ class MakerRunner:
         # of it does, which is exactly when we do not want it to.
         #
         # So the comparison has to include the book, not just our own history.
+        # AT the touch is not IN FRONT of it. `<` and `>` let a quote resting
+        # exactly on the best price pass as unchanged, so RAYIRT sat at
+        # 1,886,100 -- equal to the best ask, joining the back of that price
+        # level rather than leading the book -- while the code wanted
+        # 1,882,200. Queue priority at the same price goes to whoever was
+        # there first, and that was not us.
         top = self.latest_book(symbol)
         if top is not None:
             for q in quotes:
-                if q.side is Side.BUY and top.best_bid and q.price < top.best_bid:
+                if q.side is Side.BUY and top.best_bid and q.price <= top.best_bid:
                     return False
-                if q.side is Side.SELL and top.best_ask and q.price > top.best_ask:
+                if q.side is Side.SELL and top.best_ask and q.price >= top.best_ask:
                     return False
         return True
 
