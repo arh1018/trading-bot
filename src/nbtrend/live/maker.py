@@ -393,6 +393,31 @@ class MarketMaker:
         if ask_px <= bid_px:
             return []
 
+        # IMPROVE THE TOUCH WHERE THE SPREAD PAYS FOR IT.
+        #
+        # Skew displaces the centre, so on a book we are long the bid falls
+        # BEHIND the best bid -- RAYIRT quoted 1,817,800 against a 1,818,890
+        # best bid, 5.9 bps back, on a 357 bps spread. Sitting behind the touch
+        # earns no queue at all: the order only fills once everything in front
+        # of it does, which on a wide book means only when the price runs
+        # through us. That is adverse selection bought at full price.
+        #
+        # A wide spread has room to lean on inventory AND stay in front, so
+        # step each side to one tick inside the touch whenever doing so leaves
+        # the pair still clearing the fee. Skew keeps its say: it decides how
+        # much of the remaining width each side gets, and when the book is too
+        # thin to afford both, the floor below wins and the lean stands.
+        if tick_for_touch > 0:
+            want_bid = book.best_bid + tick_for_touch
+            want_ask = book.best_ask - tick_for_touch
+            # Only tighten -- never widen a side back out to the touch, which
+            # would undo the skew the inventory asked for.
+            new_bid = max(bid_px, want_bid) if bid_px < want_bid else bid_px
+            new_ask = min(ask_px, want_ask) if ask_px > want_ask else ask_px
+            # Keep the improvement only if the pair still clears breakeven.
+            if new_ask - new_bid >= target * ((new_ask + new_bid) / 2.0):
+                bid_px, ask_px = new_bid, new_ask
+
         # ROUND PRICES TO THE TICK. Amounts were always stepped; prices never
         # were, so a market with price_step 10 got 78,445.8497 and rejected
         # every quote -- 76 "Order Validation Failed" on TNSRIRT alone. Round
@@ -402,6 +427,23 @@ class MarketMaker:
         if tick > 0:
             bid_px = math.floor(bid_px / tick) * tick
             ask_px = math.ceil(ask_px / tick) * tick
+            if ask_px <= bid_px:
+                return []
+
+            # RE-ASSERT THE TOUCH AFTER ROUNDING. The book's best price is not
+            # necessarily tick-aligned -- RAYIRT showed a 1,856,510 best bid on
+            # a 100 tick -- so flooring our intended 1,856,610 landed on
+            # 1,856,500, one tick BEHIND the very touch we had just stepped in
+            # front of. Round outward to the next aligned price that still
+            # improves, and only when the pair goes on clearing the fee.
+            if bid_px <= book.best_bid < bid_px + tick:
+                lifted = math.floor(book.best_bid / tick) * tick + tick
+                if ask_px - lifted >= target * ((ask_px + lifted) / 2.0):
+                    bid_px = lifted
+            if ask_px - tick < book.best_ask <= ask_px:
+                lowered = math.ceil(book.best_ask / tick) * tick - tick
+                if lowered - bid_px >= target * ((lowered + bid_px) / 2.0):
+                    ask_px = lowered
             if ask_px <= bid_px:
                 return []
 
@@ -665,6 +707,25 @@ class MakerRunner:
                 return False
             if a.amount <= 0 or abs(a.amount - b.amount) / a.amount > 0.02:
                 return False
+
+        # LOSING THE TOUCH IS A CHANGE, however small the price move was.
+        #
+        # Everything above compares our new quote to our OLD one, so a book
+        # that moves out from under a resting order looks like "no change" and
+        # the order is left where it is. RAYIRT rested a bid 10 rial behind the
+        # best bid -- 0.05 bps, far inside the 3 bps tolerance, and therefore
+        # never reposted -- while the book had moved on. Behind the touch the
+        # order earns no queue at all: it fills only once everything in front
+        # of it does, which is exactly when we do not want it to.
+        #
+        # So the comparison has to include the book, not just our own history.
+        top = self.latest_book(symbol)
+        if top is not None:
+            for q in quotes:
+                if q.side is Side.BUY and top.best_bid and q.price < top.best_bid:
+                    return False
+                if q.side is Side.SELL and top.best_ask and q.price > top.best_ask:
+                    return False
         return True
 
     def latest_book(self, symbol: str):

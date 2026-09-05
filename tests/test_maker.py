@@ -1262,12 +1262,15 @@ def test_quotes_join_the_touch_by_one_tick_not_a_fraction_of_the_spread():
     bid = next(q for q in quotes if q.side.name == "BUY")
     ask = next(q for q in quotes if q.side.name == "SELL")
 
-    # The pair is one tick inside the touch rather than a tenth of the spread
-    # in. Skew displaces the CENTRE, so an individual side can sit outside the
-    # touch; the width is what this rule governs, and the width is what pays.
+    # Both sides sit one tick inside the touch, so both hold queue priority,
+    # and the pair still clears the fee. Quoting BEHIND the touch earns no
+    # queue at all -- the order fills only once everything in front of it
+    # does, which on a wide book means only when the price runs through us.
+    assert bid.price > book.best_bid, "bid must improve the touch"
+    assert ask.price < book.best_ask, "ask must improve the touch"
     quoted_bps = (ask.price - bid.price) / book.mid * 1e4
-    assert quoted_bps > 0.9 * 40.0, (
-        f"quoted {quoted_bps:.1f} bps -- no better than the old 0.9 rule"
+    assert quoted_bps >= 24.0, (
+        f"quoted {quoted_bps:.1f} bps -- inside the 24 bps fee floor"
     )
 
 
@@ -1299,3 +1302,107 @@ def test_a_tick_wider_than_the_spread_never_inverts_the_quote():
         assert ask.price > bid.price, (
             f"inverted quote: bid {bid.price} >= ask {ask.price}"
         )
+
+
+def test_inventory_skew_does_not_push_the_bid_behind_the_touch():
+    """Leaning on inventory must not cost queue position on a wide book.
+
+    RAYIRT, live: a 357 bps spread with 1,387,624 rial held gave skew +0.2775,
+    which displaced the centre far enough that the bid quoted 1,817,800 against
+    a 1,818,890 best bid -- 5.9 bps BEHIND the touch. An order behind the touch
+    fills only after everything in front of it does, which on a book that wide
+    means only when the price runs through us. The lean was right; paying for
+    it with queue position was not, because the spread had ample room for both.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 100.0
+    specs = {"RAYIRT": spec}
+    mm = MarketMaker(None, specs, ["RAYIRT"], maker_fee=0.0008, min_edge_bps=8.0,
+                     quote_notional_rial=1_500_000.0,
+                     max_inventory_rial=5_000_000.0,
+                     min_quote_rial=550_000.0, dry_run=True)
+    # ~1,387,624 rial of RAY against a 5,000,000 cap -- the live skew.
+    mm._balances = {"ray": 0.749, "rls": 50_000_000.0}
+
+    book = _book(1_818_890.0, 1_885_100.0)
+    quotes = mm.make_quotes("RAYIRT", book)
+    bid = next(q for q in quotes if q.side.name == "BUY")
+    ask = next(q for q in quotes if q.side.name == "SELL")
+
+    assert bid.price > book.best_bid, (
+        f"bid {bid.price:,.0f} is behind the {book.best_bid:,.0f} touch -- no queue"
+    )
+    assert ask.price < book.best_ask, (
+        f"ask {ask.price:,.0f} is behind the {book.best_ask:,.0f} touch -- no queue"
+    )
+    # And the pair still has to pay for itself.
+    assert (ask.price - bid.price) / book.mid * 1e4 >= 24.0
+
+
+def test_tick_rounding_does_not_drop_the_quote_behind_an_unaligned_touch():
+    """The book's best price need not sit on the tick grid.
+
+    RAYIRT showed a 1,856,510 best bid against a 100 rial tick. Stepping one
+    tick in front gave 1,856,610, which the mandatory floor-to-tick then
+    rounded to 1,856,500 -- one tick BEHIND the touch it had just improved.
+    The quote looked correct at every intermediate step and was wrong at the
+    exchange, which is the only place it counts.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 100.0
+    mm = MarketMaker(None, {"RAYIRT": spec}, ["RAYIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, quote_notional_rial=1_500_000.0,
+                     max_inventory_rial=5_000_000.0,
+                     min_quote_rial=550_000.0, dry_run=True)
+    mm._balances = {"ray": 0.749, "rls": 50_000_000.0}
+
+    book = _book(1_856_510.0, 1_886_200.0)   # neither side tick-aligned
+    quotes = mm.make_quotes("RAYIRT", book)
+    bid = next(q for q in quotes if q.side.name == "BUY")
+    ask = next(q for q in quotes if q.side.name == "SELL")
+
+    assert bid.price > book.best_bid, (
+        f"bid {bid.price:,.0f} rounded behind the {book.best_bid:,.0f} touch"
+    )
+    assert ask.price < book.best_ask
+    # Still on the tick grid, or the exchange rejects it outright.
+    assert abs(bid.price / 100.0 - round(bid.price / 100.0)) < 1e-9
+    assert abs(ask.price / 100.0 - round(ask.price / 100.0)) < 1e-9
+    assert (ask.price - bid.price) / book.mid * 1e4 >= 24.0
+
+
+def test_a_resting_quote_behind_the_touch_is_reposted():
+    """A book that moves out from under an order is a change worth acting on.
+
+    `_unchanged` compared the new quote only against our OWN previous quote, so
+    a resting order the book had left behind looked identical and was kept.
+    RAYIRT rested a bid 10 rial behind the best bid -- 0.05 bps, far inside the
+    3 bps tolerance -- and was never reposted while the book moved on. Behind
+    the touch an order earns no queue: it fills only once everything ahead of
+    it does.
+    """
+    from nbtrend.live.maker import MarketMaker, Quote, Side
+
+    spec = _Spec()
+    spec.price_step = 100.0
+    mm = MarketMaker(None, {"RAYIRT": spec}, ["RAYIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, min_quote_rial=550_000.0, dry_run=True)
+    book = _book(1_857_610.0, 1_886_200.0)
+    runner = _runner(mm, {"RAYIRT": book})
+    runner.latest_book = lambda symbol: book
+
+    stale = [Quote(Side.BUY, 1_857_100.0, 0.8), Quote(Side.SELL, 1_890_000.0, 0.8)]
+    runner._last_quotes["RAYIRT"] = stale
+    mm.book_for("RAYIRT").working = {"a": object(), "b": object()}
+
+    # Identical to what is resting, so every price/amount check says "same" --
+    # but both sides are behind the touch, so it must still repost.
+    assert runner._unchanged("RAYIRT", stale) is False
+
+    fresh = [Quote(Side.BUY, 1_857_700.0, 0.8), Quote(Side.SELL, 1_882_100.0, 0.8)]
+    runner._last_quotes["RAYIRT"] = fresh
+    assert runner._unchanged("RAYIRT", fresh) is True
