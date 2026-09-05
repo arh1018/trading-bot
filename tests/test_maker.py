@@ -1237,3 +1237,65 @@ def test_the_under_minimum_skip_message_can_actually_be_built(caplog):
     assert "ask minimum" in caplog.text, (
         "expected the skip to name the ask minimum, got: " + caplog.text
     )
+
+
+def test_quotes_join_the_touch_by_one_tick_not_a_fraction_of_the_spread():
+    """Quoting at 0.9 of the spread gave away a tenth of it for nothing.
+
+    Queue priority costs exactly one tick. Measured live before the change:
+    XLM 36.9 -> 40.5 bps, PYTH 61.5 -> 66.7, 1M_PEPE 38.0 -> 42.0.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 10.0
+    specs = {"XLMIRT": spec}
+    mm = MarketMaker(None, specs, ["XLMIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, min_quote_rial=550_000.0, dry_run=True)
+    # A few units held, well under the inventory cap, so both sides quote.
+    mm._balances = {"xlm": 4.0, "rls": 50_000_000.0}
+
+    # A wide market: 4,000 rial spread on a ~1,000,000 mid = 40 bps, so the
+    # touch binds rather than the fee floor.
+    book = _book(998_000.0, 1_002_000.0)
+    quotes = mm.make_quotes("XLMIRT", book)
+    bid = next(q for q in quotes if q.side.name == "BUY")
+    ask = next(q for q in quotes if q.side.name == "SELL")
+
+    # The pair is one tick inside the touch rather than a tenth of the spread
+    # in. Skew displaces the CENTRE, so an individual side can sit outside the
+    # touch; the width is what this rule governs, and the width is what pays.
+    quoted_bps = (ask.price - bid.price) / book.mid * 1e4
+    assert quoted_bps > 0.9 * 40.0, (
+        f"quoted {quoted_bps:.1f} bps -- no better than the old 0.9 rule"
+    )
+
+
+def test_a_tick_wider_than_the_spread_never_inverts_the_quote():
+    """A fixed offset inverts thin books; the tick guard must not.
+
+    10 rial is 0.02 bps on 1M_PEPE and 16.2 bps on 1K_SHIB. Stepping both
+    sides of 1K_SHIB's 0.8 bps spread in by a tick yields -15.4 bps -- a bid
+    above our own ask. The fee floor has to win instead.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 10.0
+    specs = {"SHIBIRT": spec}
+    mm = MarketMaker(None, specs, ["SHIBIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, min_quote_rial=550_000.0, dry_run=True)
+    mm._balances = {"shib": 100_000.0, "rls": 50_000_000.0}
+
+    # Spread narrower than one tick: 1,234 / 1,235 with a 10-rial tick.
+    book = _book(1_234.0, 1_235.0)
+    quotes = mm.make_quotes("SHIBIRT", book)
+
+    for q in quotes:
+        assert q.price > 0
+    if len(quotes) == 2:
+        bid = next(q for q in quotes if q.side.name == "BUY")
+        ask = next(q for q in quotes if q.side.name == "SELL")
+        assert ask.price > bid.price, (
+            f"inverted quote: bid {bid.price} >= ask {ask.price}"
+        )

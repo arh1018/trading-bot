@@ -339,7 +339,36 @@ class MarketMaker:
         # bps floor, which is a loss on a knife edge rather than a margin.
         target = (self.breakeven_bps() + self.min_edge_bps) / 1e4
         floor_half = (target * mid / 2.0) / (1.0 + target * skew / 2.0)
-        half_width = max(half * self.inside_touch, floor_half)
+
+        # JOIN THE TOUCH BY ONE TICK, not by a fixed fraction of the spread.
+        #
+        # `inside_touch` 0.9 gave away a tenth of every spread for nothing: the
+        # only thing that buys queue priority is being one tick better than the
+        # current best, and a tick is almost always far smaller than 10% of the
+        # spread. Measured live: XLM 36.9 -> 40.5 bps, PYTH 61.5 -> 66.7,
+        # 1M_PEPE 38.0 -> 42.0, all still in front of the book.
+        #
+        # A FIXED RIAL OFFSET CANNOT WORK HERE, which is why this uses the tick
+        # and not a constant. Ten rial is 0.02 bps on 1M_PEPE and 16.2 bps on
+        # 1K_SHIB; on 1K_SHIB, whose spread is 0.8 bps, stepping both sides in
+        # by 10 rial inverts the quote to -15.4 bps -- a bid above our own ask.
+        # The tick is the exchange's own unit of "one better" and scales with
+        # the price, so it is the right one.
+        # Step in by a tick where the market defines one. With no tick the
+        # step has no natural size, so fall back to the fraction -- quoting AT
+        # the touch is not inside it, and skew then pushes a side back out.
+        tick_for_touch = float(getattr(spec, "price_step", 0) or 0)
+        touch_half = half - tick_for_touch if tick_for_touch > 0 else half * self.inside_touch
+        if touch_half <= 0:
+            # The spread is one tick wide or less. There is no room to improve
+            # on the touch, so fall through to the fee floor rather than
+            # crossing (TNSR and 1K_SHIB both land here at times).
+            touch_half = half * self.inside_touch
+
+        # The floor still wins whenever joining the touch would quote inside
+        # the fee -- this widens the quote, it never narrows it through
+        # breakeven.
+        half_width = max(touch_half, floor_half)
 
         # Anchor the centre toward GLOBAL fair, not purely the local mid.
         #
