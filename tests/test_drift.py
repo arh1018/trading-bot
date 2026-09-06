@@ -141,10 +141,11 @@ def test_the_signal_is_measured_in_usdt_not_rial():
 
 
 class _REST:
-    def __init__(self, rising=True, rls=60_000_000.0, units=0.0):
+    def __init__(self, rising=True, rls=60_000_000.0, units=0.0, extra=None):
         self.rising = rising
         self.rls = rls
         self.units = units
+        self.extra = extra or {}
         self.orders: list[dict] = []
 
     def candles(self, symbol, resolution, start, end):
@@ -157,7 +158,9 @@ class _REST:
                             index=pd.date_range("2024-01-01", periods=n, freq="D"))
 
     def balances_detailed(self):
-        return {"rls": (self.rls, 0.0), "btc": (self.units, 0.0)}
+        out = {"rls": (self.rls, 0.0), "btc": (self.units, 0.0)}
+        out.update(self.extra)
+        return out
 
     def orderbook(self, symbol):
         from nbtrend.core.types import BookTop
@@ -208,3 +211,137 @@ def test_the_window_is_a_parameter_not_a_constant(window):
     """
     book = DriftBook(symbols=["BTCIRT"], trend_window=window)
     assert book.trend_window == window
+
+
+class _StatsREST:
+    """Volumes and spreads for the liquidity screen."""
+
+    def __init__(self, rows):
+        # rows: {src: (volume, bid, ask)}
+        self.rows = rows
+
+    def market_stats(self, src, dst="rls"):
+        row = self.rows.get(src)
+        if row is None:
+            return {}
+        vol, bid, ask = row
+        return {f"{src}-rls": {"volumeDst": str(vol),
+                               "bestBuy": str(bid), "bestSell": str(ask)}}
+
+
+def test_the_book_is_the_head_of_the_liquidity_ranking():
+    """Liquidity rank is the signal, not breadth.
+
+    Measured over 504 days: ranks 1-5 returned +930.9 percent, ranks 6-15
+    +36.7, ranks 16-30 +78.6. Random five-name baskets returned a median of
+    +72.5, no better than random twenty -- so concentration only pays when it
+    concentrates on the ranking.
+    """
+    from nbtrend.live.drift import rank_by_liquidity
+
+    specs = {f"{n}IRT": _Spec(src=n.lower()) for n in ("AAA", "BBB", "CCC", "DDD")}
+    rest = _StatsREST({
+        "aaa": (900e9, 100.0, 101.0),
+        "bbb": (100e9, 100.0, 101.0),
+        "ccc": (500e9, 100.0, 101.0),
+        "ddd": (700e9, 100.0, 101.0),
+    })
+    assert rank_by_liquidity(rest, specs, top_n=3) == ["AAAIRT", "DDDIRT", "CCCIRT"]
+
+
+def test_an_illiquid_or_wide_market_never_enters_the_book():
+    """A position we cannot exit is not an investment."""
+    from nbtrend.live.drift import rank_by_liquidity
+
+    specs = {f"{n}IRT": _Spec(src=n.lower()) for n in ("THIN", "WIDE", "GOOD")}
+    rest = _StatsREST({
+        "thin": (1e9, 100.0, 101.0),        # under the volume floor
+        "wide": (900e9, 100.0, 140.0),      # 3,400 bps spread
+        "good": (500e9, 100.0, 101.0),
+    })
+    assert rank_by_liquidity(rest, specs, top_n=10) == ["GOODIRT"]
+
+
+def test_a_market_with_no_stats_is_skipped_not_guessed():
+    """Missing data must not put a name in the book by default."""
+    from nbtrend.live.drift import rank_by_liquidity
+
+    specs = {"AAAIRT": _Spec(src="aaa"), "BBBIRT": _Spec(src="bbb")}
+    rest = _StatsREST({"aaa": (900e9, 100.0, 101.0)})     # bbb absent
+    assert rank_by_liquidity(rest, specs, top_n=10) == ["AAAIRT"]
+
+
+def test_usdt_is_the_benchmark_and_never_a_holding():
+    """USDT is the most traded rial market, so volume ranking selects it.
+
+    Live, the first auto-selected book was "USDTIRT, ZECIRT, BTCIRT, ..." --
+    it would have bought the benchmark as a position. In USDT terms that name
+    is a permanently flat line, so it corrupts the trend signal AND spends the
+    account on the thing the strategy exists to beat.
+    """
+    from nbtrend.live.drift import rank_by_liquidity
+
+    specs = {"USDTIRT": _Spec(src="usdt"), "USDCIRT": _Spec(src="usdc"),
+             "BTCIRT": _Spec(src="btc")}
+    rest = _StatsREST({
+        "usdt": (9_000e9, 100.0, 101.0),     # by far the most traded
+        "usdc": (8_000e9, 100.0, 101.0),
+        "btc": (500e9, 100.0, 101.0),
+    })
+    assert rank_by_liquidity(rest, specs, top_n=5) == ["BTCIRT"]
+
+
+def test_a_buy_is_bounded_by_cash_actually_available():
+    """Targets are computed against equity; equity is mostly coins.
+
+    Live, ZEC was asked to buy 3,154,700 rial of stock against 408,425 rial of
+    free cash and the exchange rejected it -- twice, on consecutive passes.
+    Sells go first so their proceeds fund the buys, but settlement is not
+    instant, so the buy has to be sized against the cash that exists now.
+    """
+    from nbtrend.core.types import Side
+
+    rest = _REST(rising=True, rls=1_000_000.0)
+    book = DriftBook(symbols=["BTCIRT"], trend_window=100)
+    book.min_trade_rial = 500_000.0
+    runner = DriftRunner(book, rest, dry_run=False)
+    runner.specs = {"BTCIRT": _Spec()}
+
+    runner.rebalance()
+    assert len(rest.orders) == 1
+    order = rest.orders[0]
+    assert order["side"] is Side.BUY
+    # ask is 1,001,000 in the fake book; the order must fit inside 1,000,000.
+    assert order["amount"] * 1_001_000.0 <= 1_000_000.0 + 1.0, (
+        f"bought {order['amount'] * 1_001_000.0:,.0f} rial against 1,000,000 free"
+    )
+
+
+def test_buys_across_a_whole_pass_cannot_exceed_the_cash_balance():
+    """The pass as a whole is bounded, not just each order in isolation.
+
+    The market maker had the same defect at sweep level: twelve symbols read
+    one stale snapshot, each concluded there was room, and 48,981,598 rial
+    fell to 7,118,000 straight through an 8,000,000 floor. Here the running
+    balance is decremented as each buy is placed.
+    """
+    from nbtrend.core.types import Side
+
+    # Equity is 10,000,000 -- mostly coins -- but only 1,600,000 is cash, so
+    # each 5,000,000 target far exceeds what can actually be spent.
+    # Equity ~10,000,000, of which only 1,600,000 is cash. Both markets are
+    # far under their 5,000,000 target, so both want more than the cash allows.
+    rest = _REST(rising=True, rls=1_600_000.0,
+                 extra={"a": (4.2, 0.0), "b": (0.0, 0.0)})
+    book = DriftBook(symbols=["AIRT", "BIRT"], trend_window=100)
+    book.min_trade_rial = 500_000.0
+    runner = DriftRunner(book, rest, dry_run=False)
+    runner.specs = {"AIRT": _Spec(src="a"), "BIRT": _Spec(src="b")}
+
+    runner.rebalance()
+    assert len(rest.orders) >= 1, "at least one buy should have been attempted"
+    spent = sum(o["amount"] * 1_001_000.0 for o in rest.orders
+                if o["side"] is Side.BUY)
+    assert spent <= 1_600_000.0 + 1.0, (
+        f"spent {spent:,.0f} rial against 1,600,000 free"
+    )

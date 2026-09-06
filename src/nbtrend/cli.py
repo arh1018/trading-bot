@@ -598,8 +598,16 @@ def make(
 @app.command()
 def drift(
     symbols: str = typer.Option(
-        "BTCIRT,ETHIRT,XRPIRT,DOGEIRT,ADAIRT,SOLIRT,LTCIRT,TRXIRT",
-        help="Markets to hold. Equal weight; the eight most liquid rial pairs.",
+        "",
+        help="Markets to hold, equal weight. Empty picks the most traded "
+             "automatically -- see --top-n.",
+    ),
+    top_n: int = typer.Option(
+        8,
+        help="How many markets to hold when --symbols is empty, ranked by 24h "
+             "volume. More is NOT better: measured over 504 days, 35 names "
+             "returned 37.7 percent against 117.1 for simply holding USDT, "
+             "while the eight most traded beat it several times over.",
     ),
     trend_window: int = typer.Option(
         100,
@@ -630,8 +638,8 @@ def drift(
 
     from .live.drift import DriftBook, DriftRunner
 
-    wanted = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     specs = {s.nobitex: s for s in [*cfg.enabled_symbols, cfg.fx]}
+    wanted = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     missing = [s for s in wanted if s not in specs]
     if missing:
         console.print(f"[red]not in the universe:[/red] {', '.join(missing)}")
@@ -639,6 +647,14 @@ def drift(
 
     with NobitexREST(cfg.rest_url, cfg.creds.api_token,
                      api_key=cfg.creds.api_key, api_secret=cfg.creds.api_secret) as api:
+        if not wanted:
+            from .live.drift import rank_by_liquidity
+
+            wanted = rank_by_liquidity(api, specs, top_n)
+            if not wanted:
+                console.print("[red]no market passed the liquidity screen[/red]")
+                raise typer.Exit(1)
+            console.print(f"[dim]most traded:[/dim] {', '.join(wanted)}")
         book = DriftBook(symbols=wanted, trend_window=trend_window,
                          min_trade_rial=min_trade, rebalance_band=band)
         runner = DriftRunner(book, api, dry_run=not live)
