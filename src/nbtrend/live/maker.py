@@ -110,6 +110,21 @@ class MarketMaker:
         self.maker_fee = maker_fee
         self.min_edge_bps = min_edge_bps
         self.quote_notional = quote_notional_rial
+        # SIZE THE QUOTE TO THE MARKET, not to a single global constant.
+        #
+        # A flat size is wrong in both directions at once: 1,500,000 is a
+        # rounding error in ZEC or BTC, which turn over trillions of rial a
+        # day, and it is a large share of the book in SUPER, which turns over
+        # 2.7 billion. The ladder is (24h rial volume -> rial per quote); the
+        # largest tier whose threshold the market clears wins, and anything
+        # below the smallest threshold keeps the base size.
+        self.notional_tiers: list[tuple[float, float]] = [
+            (500e9, 12_000_000.0),
+            (100e9, 8_000_000.0),
+            (20e9, 3_000_000.0),
+        ]
+        # symbol -> 24h rial volume, refreshed on its own slow clock.
+        self._volumes: dict[str, float] = {}
         self.max_inventory_rial = max_inventory_rial
         self.requote_s = requote_s
         # How far inside the market touch to quote for queue priority.
@@ -206,6 +221,20 @@ class MarketMaker:
             return 0.0
         held_rial = self.held_rial(symbol, mid)
         return max(-1.0, min(1.0, held_rial / self.max_inventory_rial))
+
+    def notional_for(self, symbol: str) -> float:
+        """Rial to quote in this market, from its 24h volume.
+
+        Falls back to the configured base size when the volume is unknown --
+        a market we have no stats for is not evidence of a deep one.
+        """
+        vol = self._volumes.get(symbol)
+        if not vol:
+            return self.quote_notional
+        for threshold, size in self.notional_tiers:
+            if vol >= threshold:
+                return size
+        return self.quote_notional
 
     def cash_room(self) -> float:
         """Rial available to spend on bids, above the reserve floor.
@@ -472,7 +501,7 @@ class MarketMaker:
         # a quote sized at the mid is worth LESS at the bid, which is how a
         # ZROIRT bid landed at 2,985,259 under a 3,000,000 minimum.
         step = spec.amount_step or 1e-8
-        amount = math.ceil(self.quote_notional / bid_px / step) * step
+        amount = math.ceil(self.notional_for(symbol) / bid_px / step) * step
         if amount <= 0:
             return []
 
@@ -668,6 +697,10 @@ class MakerRunner:
         self._fair_at = 0.0
         # Global prices move on the world's clock, not our quote loop's.
         self.fair_refresh_s = 60.0
+        self._volumes_at = 0.0
+        # A day's volume barely moves between sweeps, and this costs one REST
+        # call per market, so it runs far more slowly than the quote loop.
+        self.volume_refresh_s = 900.0
         # Markets the bot must never quote, whatever the wallet says. Anything
         # held here belongs to someone else.
         self.protected: set[str] = set()
@@ -871,6 +904,56 @@ class MakerRunner:
                 out.append(symbol)
         return out
 
+    def refresh_volumes(self, specs: dict) -> int:
+        """Update each market's 24h rial volume, which sets its quote size.
+
+        On its own slow clock: a day's volume does not move meaningfully
+        between sweeps, and this is one REST call per market -- the endpoint
+        rejects a batched srcCurrency list with a 400.
+
+        A market that fails to report keeps whatever volume it had, and a
+        market that has never reported is simply absent, which `notional_for`
+        reads as "unknown" and answers with the base size. Guessing large from
+        missing data would size a quote off nothing.
+        """
+        now = time.time()
+        if now - self._volumes_at < self.volume_refresh_s:
+            return 0
+        self._volumes_at = now
+
+        updated = 0
+        for symbol in self.mm.symbols:
+            spec = specs.get(symbol)
+            src = getattr(spec, "src", None)
+            if not src:
+                continue
+            try:
+                # `market_stats` already unwraps the "stats" envelope and
+                # returns {"btc-rls": {...}}. Unwrapping it a second time
+                # yields {} for every market, which silently sizes the whole
+                # book at the base notional -- the tiers would simply never
+                # engage, and nothing would look wrong.
+                stats = self.rest.market_stats(src.lower())
+            except Exception:
+                continue
+            row = stats.get(f"{src.lower()}-rls")
+            if not row:
+                continue
+            try:
+                vol = float(row.get("volumeDst") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if vol > 0:
+                self.mm._volumes[symbol] = vol
+                updated += 1
+        if updated:
+            sizes = {s: self.mm.notional_for(s) for s in sorted(self.mm._volumes)}
+            log.info(
+                "quote sizes by volume: %s",
+                ", ".join(f"{s}={v/1e6:.1f}M" for s, v in sizes.items()),
+            )
+        return updated
+
     def refresh_fair_values(self, specs: dict) -> int:
         """Update global fair values: global USD price x USDT/IRT.
 
@@ -938,6 +1021,8 @@ class MakerRunner:
         self.invalidate_orders_cache()
         # Global reference prices, on their own slow clock.
         self.refresh_fair_values(self.mm.specs)
+        # And each market's quote size, on a slower one still.
+        self.refresh_volumes(self.mm.specs)
 
         # Quote the configured markets PLUS anything we hold. A held position
         # with no ask is a directional bet nobody chose, and it persists until

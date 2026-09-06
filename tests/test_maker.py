@@ -1501,3 +1501,102 @@ def test_a_symbol_with_resting_orders_is_revisited_without_a_tick():
     # Cooldown still applies -- this is not a busy loop.
     assert runner.take_due(now=2_000.5) == []
     assert runner.take_due(now=2_002.0) == ["RAYIRT"]
+
+
+def test_quote_size_steps_up_with_market_volume():
+    """A flat size is wrong in both directions at once.
+
+    1,500,000 is a rounding error in ZEC (3.5 trillion rial a day) and a large
+    share of the book in SUPER (2.7 billion). Measured 24h volumes decide.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    mm = MarketMaker(None, {"XIRT": _Spec()}, ["XIRT"], maker_fee=0.0008,
+                     quote_notional_rial=1_500_000.0, dry_run=True)
+
+    for volume, expected in (
+        (3_510_873_353_862, 12_000_000.0),   # ZEC
+        (2_599_029_648_189, 12_000_000.0),   # BTC
+        (339_154_414_375, 8_000_000.0),      # BANK
+        (106_805_482_473, 8_000_000.0),      # JASMY
+        (82_060_362_889, 3_000_000.0),       # RAY
+        (64_314_167_543, 3_000_000.0),       # XLM
+        (13_968_382_794, 1_500_000.0),       # PYTH
+        (2_673_463_753, 1_500_000.0),        # SUPER
+    ):
+        mm._volumes["XIRT"] = volume
+        got = mm.notional_for("XIRT")
+        assert got == expected, f"volume {volume:,} -> {got:,.0f}, wanted {expected:,.0f}"
+
+
+def test_an_unknown_volume_does_not_buy_the_biggest_size():
+    """Missing data is not evidence of a deep market.
+
+    A stats call that fails, or a market never seen before, must fall back to
+    the base size rather than inheriting a tier it never earned.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    mm = MarketMaker(None, {"XIRT": _Spec()}, ["XIRT"], maker_fee=0.0008,
+                     quote_notional_rial=1_500_000.0, dry_run=True)
+    assert mm.notional_for("XIRT") == 1_500_000.0
+    mm._volumes["XIRT"] = 0.0
+    assert mm.notional_for("XIRT") == 1_500_000.0
+
+
+def test_a_large_tier_cannot_spend_cash_the_account_does_not_have():
+    """The tier is a ceiling, not an instruction.
+
+    Equity was 62,375,525 with 27,194,602 free when the ladder went in, so two
+    12,000,000 quotes would exhaust the account and the full ladder across
+    every market is 3.4x over. The cash floor has to win, or a deep market
+    simply drains the book.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 10.0
+    mm = MarketMaker(None, {"BTCIRT": spec}, ["BTCIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, quote_notional_rial=1_500_000.0,
+                     max_inventory_rial=50_000_000.0,
+                     min_quote_rial=550_000.0, min_cash_rial=5_000_000.0,
+                     dry_run=True)
+    mm._volumes["BTCIRT"] = 2_599_029_648_189      # -> 12,000,000 tier
+    assert mm.notional_for("BTCIRT") == 12_000_000.0
+
+    # Only 6,000,000 free against a 5,000,000 reserve: 1,000,000 spendable.
+    mm._balances = {"btc": 0.0, "rls": 6_000_000.0}
+    book = _book(998_000.0, 1_002_000.0)
+    quotes = mm.make_quotes("BTCIRT", book)
+
+    for q in quotes:
+        if q.side.name == "BUY":
+            assert q.price * q.amount <= 1_000_000.0 + 1.0, (
+                f"bid of {q.price * q.amount:,.0f} rial against 1,000,000 spendable"
+            )
+
+
+def test_volume_refresh_reads_the_shape_market_stats_actually_returns():
+    """`market_stats` already unwraps the "stats" envelope.
+
+    Calling `.get("stats")` on its result yields {} for every market, so no
+    volume is ever recorded and every market quietly keeps the base notional.
+    Nothing raises and nothing looks wrong -- the tiers simply never engage.
+    """
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def market_stats(self, src, dst="rls"):
+            # Exactly what the real client returns: already unwrapped.
+            return {f"{src}-rls": {"volumeDst": "3510873353862", "bestBuy": "1",
+                                   "bestSell": "2"}}
+
+    spec = _Spec()
+    spec.src = "zec"
+    mm = MarketMaker(None, {"ZECIRT": spec}, ["ZECIRT"], maker_fee=0.0008,
+                     quote_notional_rial=1_500_000.0, dry_run=True)
+    runner = MakerRunner(None, mm, _REST())
+
+    assert runner.refresh_volumes({"ZECIRT": spec}) == 1
+    assert mm._volumes["ZECIRT"] == 3_510_873_353_862.0
+    assert mm.notional_for("ZECIRT") == 12_000_000.0
