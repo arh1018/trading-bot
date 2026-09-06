@@ -822,17 +822,36 @@ def test_a_protected_market_is_never_quoted_even_when_held():
     assert "AVAXIRT" in held, "our own inventory still is"
 
 
-def test_the_gold_pairs_are_protected_by_default():
-    """A default the operator has to actively remove, not one they must
-    remember to add."""
-    import inspect
+def test_gold_is_admitted_by_the_edge_gate_like_any_other_market():
+    """Gold is no longer protected, and must earn its place on the numbers.
 
-    from nbtrend.cli import make
+    PAXG and XAUT were excluded while the account owner held a position in
+    them by hand -- wallet discovery would otherwise have quoted 478,939,651
+    rial of someone else's gold. That position is gone, so the guard is gone
+    with it, and the pairs are in the universe.
 
-    default = inspect.signature(make).parameters["protect"].default
-    text = getattr(default, "default", default)
-    for pair in ("PAXGIRT", "XAUTIRT"):
-        assert pair in str(text)
+    They still should not trade at current spreads: sampled over 70 seconds,
+    XAUT ran a 9.3 bps median (19.7 at its widest) and PAXG 2.4, against a 16
+    bps fee and a 24 bps floor. Nothing special about gold does this -- the
+    ordinary edge gate refuses it, which is the point.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 10.0
+    mm = MarketMaker(None, {"XAUTIRT": spec}, ["XAUTIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, min_quote_rial=550_000.0, dry_run=True)
+    mm._balances = {"xaut": 0.5, "rls": 50_000_000.0}
+
+    # The observed book: 10,140,555,580 / 10,150,000,090 -- 9.3 bps.
+    thin = _book(10_140_555_580.0, 10_150_000_090.0)
+    assert mm.make_quotes("XAUTIRT", thin) == [], (
+        "a 9.3 bps gold spread loses 6.7 bps to the fee on every round trip"
+    )
+
+    # Widen it past the floor and the same market is quoted, no special case.
+    wide = _book(10_100_000_000.0, 10_190_000_000.0)      # ~89 bps
+    assert mm.make_quotes("XAUTIRT", wide), "gold must quote when it pays"
 
 
 # -- sweep-level accounting -------------------------------------------------

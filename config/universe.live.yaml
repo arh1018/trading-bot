@@ -797,3 +797,17 @@ symbols:
   amount_step: 0.1
   price_step: 10
   enabled: true
+- nobitex: PAXGIRT
+  src: paxg
+  dst: rls
+  tradingview: BINANCE:PAXGUSDT
+  amount_step: 0.00001
+  price_step: 10
+  enabled: true
+- nobitex: XAUTIRT
+  src: xaut
+  dst: rls
+  tradingview: BINANCE:XAUTUSDT
+  amount_step: 0.00001
+  price_step: 10
+  enabled: true

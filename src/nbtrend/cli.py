@@ -480,9 +480,10 @@ def make(
         True, help="Drive quoting from the websocket book instead of polling."
     ),
     protect: str = typer.Option(
-        "PAXGIRT,XAUTIRT,PAXGUSDT,XAUTUSDT",
+        "",
         help="Markets the bot must never quote, even if held (comma separated). "
-             "Defaults to the gold pairs, which the account owner trades by hand.",
+             "Empty by default; the gold pairs were listed here while the "
+             "account owner held a position in them by hand.",
     ),
     log_level: str = typer.Option("INFO"),
 ) -> None:
