@@ -1881,3 +1881,117 @@ def test_the_range_gate_reaches_both_runners():
     from nbtrend.live.maker import MarketMaker
 
     assert "max_range_ratio" in inspect.signature(MarketMaker.__init__).parameters
+
+
+def test_a_stop_measured_in_spreads_catches_what_the_hold_cap_cannot():
+    """1K_BONK lost 62,093 rial in SIXTEEN SECONDS.
+
+    Bought 666 units at 7,507 and sold 645 at 7,411, down 1.28 percent, with
+    the position open a quarter of a minute -- nowhere near a five minute cap,
+    in a market that passed the range gate at 8x. Time was never going to
+    catch that; distance from cost is.
+    """
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def orderbook(self, symbol):
+            # The book AFTER the drop: the sell went off at 7,411, so the mid
+            # had fallen there from a 7,507 cost -- 1.28 percent, against a
+            # ~56 bps spread, so well past a 1x stop.
+            return _book(7_390.0, 7_432.0)
+
+    mm = MarketMaker(None, {"1K_BONKIRT": _Spec()}, ["1K_BONKIRT"],
+                     maker_fee=0.0008, dry_run=True)
+    runner = MakerRunner(None, mm, _REST())
+    runner.max_loss_spreads = 1.0
+    runner._position_cost = {"1K_BONKIRT": 7_507.0}
+
+    losing = runner.losing_positions(1.0)
+    assert [s for s, _ in losing] == ["1K_BONKIRT"]
+    assert losing[0][1] > 0.005, "the mid is well below cost"
+
+    # Held only moments: the hold cap sees nothing to do.
+    runner._position_age = {"1K_BONKIRT": time.time() - 16.0}
+    assert runner.stale_positions(300.0) == []
+
+
+def test_the_stop_scales_with_each_market_not_a_fixed_percent():
+    """0.2 percent is inside XAUT's half-spread and a quarter of LA's.
+
+    A quote rests about half a spread from the mid, so an adverse move of half
+    a spread is the ordinary tick that fills us. One percentage cannot be
+    outside that in a 42 bps market and inside it in a 151 bps one, which is
+    why the unit is spreads.
+    """
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    books = {
+        "XAUTIRT": _book(9_979_000.0, 10_021_000.0),   # ~42 bps
+        "LAIRT": _book(992_500.0, 1_007_500.0),        # ~151 bps
+    }
+
+    class _REST:
+        def orderbook(self, symbol):
+            return books[symbol]
+
+    mm = MarketMaker(None, {k: _Spec() for k in books}, list(books),
+                     maker_fee=0.0008, dry_run=True)
+    runner = MakerRunner(None, mm, _REST())
+    # Both down 0.5 percent from cost.
+    runner._position_cost = {
+        "XAUTIRT": books["XAUTIRT"].mid / (1 - 0.005),
+        "LAIRT": books["LAIRT"].mid / (1 - 0.005),
+    }
+    fired = {s for s, _ in runner.losing_positions(1.0)}
+    assert "XAUTIRT" in fired, "0.5 percent is more than one 42 bps spread"
+    assert "LAIRT" not in fired, "0.5 percent is well inside one 151 bps spread"
+
+
+def test_the_stop_runs_even_when_the_hold_cap_is_off():
+    """Gating the exit on the hold cap would make the stop silently inert.
+
+    The same shape as the socket runner never receiving `--requote`: a setting
+    that exists, reads as configured, and does nothing.
+    """
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    placed = []
+
+    class _REST:
+        def orderbook(self, symbol):
+            return _book(900.0, 1_100.0)
+
+        def add_order(self, **kw):
+            placed.append(kw)
+            return object()
+
+    mm = MarketMaker(None, {"XIRT": _Spec()}, ["XIRT"], maker_fee=0.0008,
+                     min_quote_rial=550_000.0, dry_run=False)
+    mm._balances = {"x": 10_000.0}
+    runner = MakerRunner(None, mm, _REST())
+    runner.max_loss_spreads = 1.0
+    runner._position_cost = {"XIRT": 2_000.0}      # mid 1,000: far below cost
+
+    assert runner.exit_stale_positions(0.0) == 1, "the stop must run alone"
+    assert placed, "no order was actually sent"
+
+
+def test_position_cost_is_volume_weighted_across_fills():
+    """A position built from several fills has one cost, not the first one."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def trades_list(self):
+            return [
+                {"market": "X-RLS", "type": "buy", "amount": "100",
+                 "price": "1000", "timestamp": "2026-09-06T07:00:00+00:00"},
+                {"market": "X-RLS", "type": "buy", "amount": "300",
+                 "price": "2000", "timestamp": "2026-09-06T07:01:00+00:00"},
+            ]
+
+    mm = MarketMaker(None, {"XIRT": _Spec()}, ["XIRT"], maker_fee=0.0008,
+                     dry_run=True)
+    runner = MakerRunner(None, mm, _REST())
+    runner.refresh_position_ages()
+    # (100*1000 + 300*2000) / 400 = 1,750
+    assert runner._position_cost["XIRT"] == 1_750.0

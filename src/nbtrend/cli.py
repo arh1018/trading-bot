@@ -266,7 +266,8 @@ def run(
 
 async def _socket_loop(cfg, mm, api, symbols, deadline, fallback_s: float,
                        protected: set[str] | None = None,
-                       max_hold_s: float = 0.0) -> None:
+                       max_hold_s: float = 0.0,
+                       max_loss_spreads: float = 0.0) -> None:
     """Quote from websocket book events rather than a polling clock.
 
     The blocking work -- placing and cancelling orders -- runs in a thread, not
@@ -290,6 +291,7 @@ async def _socket_loop(cfg, mm, api, symbols, deadline, fallback_s: float,
     # set on that one has to be set here too -- `--requote` was wired only to
     # the fallback path once already, and quoting ran at its 2s default.
     runner.max_hold_s = max_hold_s
+    runner.max_loss_spreads = max_loss_spreads
 
     def _handler(symbol: str):
         # Handlers are called as (channel, payload) -- see nobitex_ws.Handler.
@@ -481,6 +483,13 @@ def make(
              "spreads. 0 disables it. ~12 keeps the markets whose spread can "
              "pay for their own volatility.",
     ),
+    max_loss_spreads: float = typer.Option(
+        0.0,
+        help="Cross out a position once the mid falls this many SPREADS below "
+             "its cost. 0 disables it. Measured in spreads, not percent, "
+             "because a quote rests half a spread from the mid and a fixed "
+             "percentage is a hair-trigger in one market and a no-op in another.",
+    ),
     max_hold_min: float = typer.Option(
         0.0,
         help="Cross the spread to close a position that has not completed a "
@@ -541,6 +550,7 @@ def make(
         )
         runner = MakerRunner(cfg, mm, api)
         runner.max_hold_s = max_hold_min * 60.0
+        runner.max_loss_spreads = max_loss_spreads
         protected = {p.strip().upper() for p in protect.split(',') if p.strip()}
         runner.protected = protected
 
@@ -564,7 +574,8 @@ def make(
         try:
             if socket:
                 asyncio.run(_socket_loop(cfg, mm, api, wanted, deadline, requote,
-                                         protected, max_hold_min * 60.0))
+                                         protected, max_hold_min * 60.0,
+                                         max_loss_spreads))
             else:
                 while time.time() < deadline:
                     runner.sweep(wanted)

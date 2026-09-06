@@ -776,12 +776,28 @@ class MakerRunner:
         # Global prices move on the world's clock, not our quote loop's.
         self.fair_refresh_s = 60.0
         self._volumes_at = 0.0
-        # symbol -> unix time of the OLDEST buy still unmatched by a sell.
+        # symbol -> (unix time, volume-weighted cost) of the open position.
+        # The cost is what a stop measures against; the time is the hold cap.
         # Derived from the exchange's own trade history rather than tracked in
         # memory, because the keepalive cycles this process and an in-memory
         # clock would reset the age of every position on every restart --
         # exactly when a stuck position most needs to be noticed.
         self._position_age: dict[str, float] = {}
+        # symbol -> average rial cost of the units still held.
+        self._position_cost: dict[str, float] = {}
+        # Exit when the mid falls this many SPREADS below our cost. 0 is off.
+        #
+        # A FIXED PERCENTAGE CANNOT WORK ACROSS THESE MARKETS. 0.2% is inside
+        # XAUT's half-spread (0.212%) and a quarter of LA's (0.755%), so one
+        # number is simultaneously a hair-trigger and a no-op. A quote rests
+        # about half a spread from the mid, so an adverse move of half a
+        # spread is the ordinary tick that fills us -- a stop inside that
+        # turns every round trip into a taker exit.
+        #
+        # Measured over 18 round trips: at 1x the spread it fires twice and
+        # turns -77,959 into -35,420, while both winners (up 0.38 and 0.48
+        # percent, each under 1x their own spread) are untouched.
+        self.max_loss_spreads: float = 0.0
         # 0 disables the cap. Set from the CLI.
         self.max_hold_s: float = 0.0
         self._ages_at = 0.0
@@ -931,11 +947,30 @@ class MakerRunner:
         Only the ask side is crossed. A stale position here is always long
         (spot cannot be short), so exiting means selling what we hold.
         """
-        if max_hold_s <= 0:
+        # Either mechanism alone is reason enough to run. Gating on the hold
+        # cap would have made `--max-loss-spreads` silently inert whenever the
+        # time cap was off -- the same shape of bug as the socket runner never
+        # receiving `--requote`.
+        if max_hold_s <= 0 and self.max_loss_spreads <= 0:
             return 0
 
         exited = 0
+        # A stop and a hold cap answer different questions -- "how far has it
+        # gone against us" and "how long has it sat" -- and a position can hit
+        # either first. Both feed the same exit; the reason is logged so the
+        # next measurement can tell which one is doing the work.
+        reasons: dict[str, str] = {}
+        targets: list[tuple[str, float]] = []
+        for symbol, drop in self.losing_positions(self.max_loss_spreads):
+            reasons[symbol] = f"down {drop * 100:.2f} percent from cost"
+            targets.append((symbol, drop))
         for symbol, age in self.stale_positions(max_hold_s):
+            if symbol in reasons:
+                continue
+            reasons[symbol] = f"held {age:.0f}s (cap {max_hold_s:.0f}s)"
+            targets.append((symbol, age))
+
+        for symbol, _ in targets:
             if symbol in self.protected:
                 continue
             spec = self.mm.specs.get(symbol)
@@ -959,8 +994,8 @@ class MakerRunner:
             self.cancel_working(symbol)
             if self.mm.dry_run:
                 log.info(
-                    "[dry-run] %s would cross out %.8f after %.0fs held",
-                    symbol, amount, age,
+                    "[dry-run] %s would cross out %.8f -- %s",
+                    symbol, amount, reasons.get(symbol, "?"),
                 )
                 exited += 1
                 continue
@@ -984,12 +1019,13 @@ class MakerRunner:
                 # Forget the age NOW; the refresh will restore it if the market
                 # order did not in fact clear the position.
                 self._position_age.pop(symbol, None)
+                self._position_cost.pop(symbol, None)
                 self._balances_at = 0.0
                 exited += 1
                 log.warning(
-                    "%s: crossed out %.8f after %.0fs held (cap %.0fs) -- "
-                    "taking the taker fee rather than the drift",
-                    symbol, amount, age, max_hold_s,
+                    "%s: crossed out %.8f -- %s -- taking the taker fee "
+                    "rather than the drift",
+                    symbol, amount, reasons.get(symbol, "?"),
                 )
             except Exception:
                 log.exception("%s: could not cross out stale position", symbol)
@@ -1097,7 +1133,7 @@ class MakerRunner:
             log.debug("could not read trade history for position ages", exc_info=True)
             return 0
 
-        legs: dict[str, list[tuple[float, float]]] = defaultdict(list)
+        legs: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
         for t in sorted(trades, key=lambda x: _trade_ts(x.get("timestamp"))):
             market = str(t.get("market") or "")
             symbol = _market_to_symbol(market)
@@ -1109,22 +1145,34 @@ class MakerRunner:
                 continue
             if amount <= 0:
                 continue
+            try:
+                price = float(t.get("price") or 0.0)
+            except (TypeError, ValueError):
+                price = 0.0
             if t.get("type") == "buy":
-                legs[symbol].append((_trade_ts(t.get("timestamp")), amount))
+                legs[symbol].append((_trade_ts(t.get("timestamp")), amount, price))
                 continue
             left = amount
             while left > 1e-12 and legs[symbol]:
-                ts, amt = legs[symbol][0]
+                ts, amt, px = legs[symbol][0]
                 take = min(left, amt)
                 left -= take
                 if take >= amt - 1e-12:
                     legs[symbol].pop(0)
                 else:
-                    legs[symbol][0] = (ts, amt - take)
+                    legs[symbol][0] = (ts, amt - take, px)
 
         self._position_age = {
             sym: rows[0][0] for sym, rows in legs.items() if rows
         }
+        # Volume-weighted cost of what is still held, which is what a stop
+        # measures against. The oldest buy's price alone would misprice a
+        # position built from several fills at different levels.
+        self._position_cost = {}
+        for sym, rows in legs.items():
+            units = sum(amt for _, amt, _ in rows)
+            if units > 0:
+                self._position_cost[sym] = sum(amt * px for _, amt, px in rows) / units
         return len(self._position_age)
 
     def stale_positions(self, max_hold_s: float) -> list[tuple[str, float]]:
@@ -1137,6 +1185,41 @@ class MakerRunner:
             for sym, opened in self._position_age.items()
             if opened > 0 and now - opened >= max_hold_s
         ]
+        return sorted(out, key=lambda r: -r[1])
+
+    def losing_positions(self, max_loss_spreads: float) -> list[tuple[str, float]]:
+        """Positions whose mid has fallen past the stop, worst first.
+
+        The stop is measured in SPREADS rather than percent, because the same
+        percentage means different things market to market: 0.2 percent is
+        inside XAUT's half-spread and a quarter of LA's. A quote rests about
+        half a spread from the mid, so scaling the stop to the spread keeps it
+        outside the ordinary fill and still catches a real move.
+
+        This is what the hold cap could not do. 1K_BONK bought 666 units at
+        7,507 and sold 645 at 7,411 SIXTEEN SECONDS later, down 1.28 percent
+        for -62,093 rial -- nowhere near a five minute cap, and the market had
+        passed the range gate at 8x.
+        """
+        if max_loss_spreads <= 0:
+            return []
+        out = []
+        for sym, cost in self._position_cost.items():
+            if cost <= 0:
+                continue
+            top = self.latest_book(sym)
+            if top is None:
+                try:
+                    top = self.rest.orderbook(sym)
+                except Exception:
+                    continue
+            mid = top.mid
+            if mid <= 0 or top.best_ask <= top.best_bid:
+                continue
+            spread_frac = (top.best_ask - top.best_bid) / mid
+            drop = (cost - mid) / cost
+            if drop >= max_loss_spreads * spread_frac:
+                out.append((sym, drop))
         return sorted(out, key=lambda r: -r[1])
 
     def refresh_volumes(self, specs: dict) -> int:
