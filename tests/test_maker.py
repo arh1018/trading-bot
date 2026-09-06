@@ -1811,3 +1811,73 @@ def test_a_closed_position_is_not_sold_twice():
     # The wallet has not refreshed, but the position must not fire again.
     assert runner.exit_stale_positions(300.0) == 0, "sold the same position twice"
     assert len(placed) == 1
+
+
+def test_a_market_whose_range_dwarfs_its_spread_is_refused():
+    """The gate that describes RISK, not reward.
+
+    COTI ran a 2,730 bps daily range against a 42 bps spread -- 64 times over
+    -- and cost 118,160 rial in a morning. Every other check read that market
+    as attractive: the spread cleared the edge floor comfortably, the volume
+    earned the 8M tier. A wide spread on these venues is usually compensation
+    for violent price action, not free money.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 10.0
+    mm = MarketMaker(None, {"COTIIRT": spec}, ["COTIIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, min_quote_rial=550_000.0,
+                     max_range_ratio=12.0, dry_run=True)
+    mm._balances = {"coti": 100.0, "rls": 50_000_000.0}
+
+    # A 42 bps spread -- comfortably over the 24 bps floor on its own.
+    book = _book(999_790.0, 1_004_000.0)
+    assert mm.edge_bps(book) > mm.min_edge_bps, "the spread alone looks fine"
+
+    mm._day_range_bps["COTIIRT"] = 2_730.0            # measured
+    assert mm.range_ratio("COTIIRT", book) > 60.0
+    assert mm.make_quotes("COTIIRT", book) == [], "a 64x market must be refused"
+
+    # LA: 700 bps of range against a 361 bps spread -- 2x, genuinely makeable.
+    mm._day_range_bps["COTIIRT"] = 84.0               # ~2x this book's spread
+    assert mm.make_quotes("COTIIRT", book), "a 2x market must still be quoted"
+
+
+def test_the_range_gate_is_off_until_it_is_configured():
+    """0 disables it, and an unknown range never refuses a market.
+
+    Missing stats must not silently halt trading -- that failure looks exactly
+    like working.
+    """
+    from nbtrend.live.maker import MarketMaker
+
+    spec = _Spec()
+    spec.price_step = 10.0
+    mm = MarketMaker(None, {"XIRT": spec}, ["XIRT"], maker_fee=0.0008,
+                     min_edge_bps=8.0, min_quote_rial=550_000.0, dry_run=True)
+    mm._balances = {"x": 100.0, "rls": 50_000_000.0}
+    book = _book(999_790.0, 1_004_000.0)
+
+    mm._day_range_bps["XIRT"] = 99_999.0
+    assert mm.max_range_ratio == 0.0
+    assert mm.make_quotes("XIRT", book), "the gate is off by default"
+
+    mm.max_range_ratio = 12.0
+    mm._day_range_bps.clear()
+    assert mm.range_ratio("XIRT", book) is None
+    assert mm.make_quotes("XIRT", book), "an unknown range must not refuse"
+
+
+def test_the_range_gate_reaches_both_runners():
+    """It lives on MarketMaker, which both runners share.
+
+    The hold cap had to be passed to `_socket_loop` separately and was inert
+    there until that was found; putting this on the maker makes that class of
+    bug unrepresentable.
+    """
+    import inspect
+
+    from nbtrend.live.maker import MarketMaker
+
+    assert "max_range_ratio" in inspect.signature(MarketMaker.__init__).parameters

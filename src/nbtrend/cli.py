@@ -475,6 +475,12 @@ def make(
     min_cash: float = typer.Option(
         0.0, help="Rial to keep unspent across the whole book (portfolio floor)."
     ),
+    max_range_ratio: float = typer.Option(
+        0.0,
+        help="Refuse a market whose daily high-low range exceeds this many "
+             "spreads. 0 disables it. ~12 keeps the markets whose spread can "
+             "pay for their own volatility.",
+    ),
     max_hold_min: float = typer.Option(
         0.0,
         help="Cross the spread to close a position that has not completed a "
@@ -529,6 +535,7 @@ def make(
             max_inventory_rial=max_inventory,
             min_cash_rial=min_cash,
             min_quote_rial=min_quote_rial,
+            max_range_ratio=max_range_ratio,
             requote_s=requote,
             dry_run=not live,
         )

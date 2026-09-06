@@ -125,6 +125,7 @@ class MarketMaker:
         min_quote_rial: float = 550_000.0,
         min_cash_rial: float = 0.0,
         max_basis: float = 0.02,
+        max_range_ratio: float = 0.0,
         fair_weight: float = 0.5,
         max_orders_per_window: int = 240,
         dry_run: bool = True,
@@ -150,6 +151,17 @@ class MarketMaker:
         ]
         # symbol -> 24h rial volume, refreshed on its own slow clock.
         self._volumes: dict[str, float] = {}
+        # symbol -> (day high - day low) in bps, from the same stats call.
+        # Paired with the spread this answers the question that actually
+        # decides whether a market can be made: how many times can the price
+        # move against us, in a day, for each spread we collect?
+        self._day_range_bps: dict[str, float] = {}
+        # Refuse a market whose daily range exceeds this many spreads. 0 is
+        # off. Making a market is selling insurance against the price moving
+        # while we hold; the spread is the premium and the daily range is the
+        # claim. COTI paid 42 bps against a 2,730 bps range -- 64x -- and lost
+        # 118,160 rial in a morning doing exactly what it was told.
+        self.max_range_ratio: float = max_range_ratio
         self.max_inventory_rial = max_inventory_rial
         self.requote_s = requote_s
         # How far inside the market touch to quote for queue priority.
@@ -340,6 +352,26 @@ class MarketMaker:
                 global_usd, fx_rial_per_usdt, max(1, multiplier)
             )
 
+    def range_ratio(self, symbol: str, book: BookTop) -> float | None:
+        """Daily range divided by the current spread, or None if unknown.
+
+        The spread is what a completed round trip pays. The daily range is how
+        far the price can travel against an open position before it completes.
+        A ratio of 2 is a market whose whole day fits inside two spreads; a
+        ratio of 64 is one where the spread is a rounding error against the
+        move, and no queue position, hold cap or edge floor survives that.
+        """
+        rng = self._day_range_bps.get(symbol)
+        if not rng:
+            return None
+        mid = book.mid
+        if mid <= 0:
+            return None
+        spread = (book.best_ask - book.best_bid) / mid * 1e4
+        if spread <= 0:
+            return None
+        return rng / spread
+
     def basis(self, symbol: str, book: BookTop) -> float | None:
         """Local mid versus global fair, as a fraction. + means locally rich."""
         fair = self.fair_rial(symbol)
@@ -357,6 +389,27 @@ class MarketMaker:
         # that means buying just before the local price catches down (or
         # selling before it catches up). The spread looks the same; the fill is
         # systematically bad.
+        # REFUSE A MARKET WHOSE RANGE DWARFS ITS SPREAD.
+        #
+        # Checked before everything else because it is the only gate that
+        # describes the RISK rather than the reward. A wide spread reads as
+        # opportunity to every other check here -- COTI's 42 bps passed the
+        # edge floor comfortably -- but on these venues a wide spread is
+        # usually compensation for violent price action, not free money.
+        #
+        # Measured: COTI ran a 2,730 bps daily range against that 42 bps
+        # spread, 64 times over, and cost 118,160 rial in a morning. Nothing
+        # downstream can save a position in a market like that; the hold cap
+        # and the edge floor were both tried first and neither helped, because
+        # the losses were spread across every hold time and every spread.
+        ratio = self.range_ratio(symbol, book)
+        if self.max_range_ratio > 0 and ratio is not None and ratio > self.max_range_ratio:
+            log.info(
+                "%s: daily range is %.0fx the spread (limit %.0fx) -- not quoting",
+                symbol, ratio, self.max_range_ratio,
+            )
+            return []
+
         drift = self.basis(symbol, book)
         if drift is not None and abs(drift) > self.max_basis:
             log.info(
@@ -1128,6 +1181,14 @@ class MakerRunner:
             if vol > 0:
                 self.mm._volumes[symbol] = vol
                 updated += 1
+            # The same call carries the day's high and low, which is what the
+            # range gate needs -- no extra request for it.
+            try:
+                low, high = float(row.get("dayLow") or 0.0), float(row.get("dayHigh") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if low > 0 and high > low:
+                self.mm._day_range_bps[symbol] = (high - low) / ((high + low) / 2.0) * 1e4
         if updated:
             sizes = {s: self.mm.notional_for(s) for s in sorted(self.mm._volumes)}
             log.info(
