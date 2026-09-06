@@ -7,6 +7,8 @@ strategy into an unintended directional bet.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from nbtrend.config import load_config
@@ -1619,3 +1621,193 @@ def test_volume_refresh_reads_the_shape_market_stats_actually_returns():
     assert runner.refresh_volumes({"ZECIRT": spec}) == 1
     assert mm._volumes["ZECIRT"] == 3_510_873_353_862.0
     assert mm.notional_for("ZECIRT") == 12_000_000.0
+
+
+def _trade(market, side, amount, ts, price=1000.0):
+    return {"market": market, "type": side, "amount": str(amount),
+            "price": str(price), "timestamp": ts}
+
+
+def test_position_age_comes_from_the_oldest_unmatched_buy():
+    """FIFO-match sells against buys; what is left is the open position.
+
+    The age that matters is the OLDEST remaining buy, because that is the
+    money that has been sitting longest without completing a round trip.
+    """
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def trades_list(self):
+            return [
+                _trade("COTI-RLS", "buy", 100, "2026-09-06T06:00:00+00:00"),
+                _trade("COTI-RLS", "buy", 50, "2026-09-06T06:30:00+00:00"),
+                # Closes the first buy entirely and part of the second.
+                _trade("COTI-RLS", "sell", 120, "2026-09-06T06:45:00+00:00"),
+            ]
+
+    mm = MarketMaker(None, {"COTIIRT": _Spec()}, ["COTIIRT"], maker_fee=0.0008,
+                     dry_run=True)
+    runner = MakerRunner(None, mm, _REST())
+    assert runner.refresh_position_ages() == 1
+
+    from datetime import datetime
+    expected = datetime.fromisoformat("2026-09-06T06:30:00+00:00").timestamp()
+    assert runner._position_age["COTIIRT"] == expected, (
+        "the 06:00 buy was fully closed; the open position dates from 06:30"
+    )
+
+
+def test_a_fully_closed_market_has_no_open_position():
+    """Sells matching every buy leave nothing to age."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def trades_list(self):
+            return [
+                _trade("FLOW-RLS", "buy", 10, "2026-09-06T06:00:00+00:00"),
+                _trade("FLOW-RLS", "sell", 10, "2026-09-06T06:10:00+00:00"),
+            ]
+
+    mm = MarketMaker(None, {"FLOWIRT": _Spec()}, ["FLOWIRT"], maker_fee=0.0008,
+                     dry_run=True)
+    runner = MakerRunner(None, mm, _REST())
+    runner.refresh_position_ages()
+    assert runner._position_age == {}
+    assert runner.stale_positions(60.0) == []
+
+
+def test_stale_positions_are_reported_oldest_first():
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    mm = MarketMaker(None, {"AIRT": _Spec(), "BIRT": _Spec()}, ["AIRT", "BIRT"],
+                     maker_fee=0.0008, dry_run=True)
+    runner = MakerRunner(None, mm, None)
+    now = time.time()
+    runner._position_age = {"AIRT": now - 400.0, "BIRT": now - 900.0}
+
+    stale = runner.stale_positions(300.0)
+    assert [s for s, _ in stale] == ["BIRT", "AIRT"], "oldest first"
+    assert runner.stale_positions(1_800.0) == [], "nothing past a 30 minute cap"
+    assert runner.stale_positions(0.0) == [], "0 disables the cap"
+
+
+def test_a_stale_position_under_the_exchange_minimum_is_not_crossed():
+    """Crossing out a dust position would just be rejected.
+
+    Below the minimum there is nothing to do but let the ordinary ask work it
+    out, and attempting it burns an order slot on a guaranteed rejection.
+    """
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def orderbook(self, symbol):
+            return _book(998_000.0, 1_002_000.0)
+
+    spec = _Spec()
+    mm = MarketMaker(None, {"XIRT": spec}, ["XIRT"], maker_fee=0.0008,
+                     min_quote_rial=550_000.0, dry_run=False)
+    mm._balances = {"x": 0.0001}          # ~100 rial, far under the minimum
+    runner = MakerRunner(None, mm, _REST())
+    runner._position_age = {"XIRT": time.time() - 3_600.0}
+
+    assert runner.exit_stale_positions(300.0) == 0
+
+
+def test_a_protected_market_is_never_crossed_out():
+    """Protection outranks the hold cap, as it outranks quoting."""
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    class _REST:
+        def orderbook(self, symbol):
+            return _book(998_000.0, 1_002_000.0)
+
+    mm = MarketMaker(None, {"PAXGIRT": _Spec()}, ["PAXGIRT"], maker_fee=0.0008,
+                     min_quote_rial=550_000.0, dry_run=False)
+    mm._balances = {"paxg": 100.0}
+    runner = MakerRunner(None, mm, _REST())
+    runner.protected = {"PAXGIRT"}
+    runner._position_age = {"PAXGIRT": time.time() - 86_400.0}
+
+    assert runner.exit_stale_positions(300.0) == 0
+
+
+def test_the_hold_cap_reaches_the_socket_runner_too():
+    """The socket runner is a separate object from the REST one.
+
+    `--requote` was wired only to the fallback path once already, and the
+    socket path quoted at its 2s default until that was found. A setting that
+    exists on one runner and not the other is silently inert.
+    """
+    import inspect
+
+    from nbtrend.cli import _socket_loop
+
+    assert "max_hold_s" in inspect.signature(_socket_loop).parameters
+    src = inspect.getsource(_socket_loop)
+    assert "runner.max_hold_s" in src, "the socket runner never receives the cap"
+
+
+def test_the_hold_cap_catches_the_trades_that_actually_lost():
+    """The cap is set from measurement, not intuition.
+
+    Nine completed round trips, split cleanly by duration:
+
+        winners  n=5  median hold  3.3 min  total  +63,039
+        losers   n=4  median hold 16.3 min  total -193,427
+
+    Every winner closed inside 3.5 minutes; both disasters (COTI -133,920 at
+    8.5 min, BOME -58,700 at 16.3) were held past 8. A five minute cap keeps
+    every winner and cuts both, which is why it is five and not fifteen.
+    """
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    mm = MarketMaker(None, {"COTIIRT": _Spec()}, ["COTIIRT"], maker_fee=0.0008,
+                     dry_run=True)
+    runner = MakerRunner(None, mm, None)
+    now = time.time()
+
+    # The observed winners, by hold time.
+    runner._position_age = {"COTIIRT": now - 3.3 * 60}
+    assert runner.stale_positions(300.0) == [], "a 3.3 min winner must be left alone"
+
+    # COTI's -133,920, held 8.5 minutes.
+    runner._position_age = {"COTIIRT": now - 8.5 * 60}
+    assert [s for s, _ in runner.stale_positions(300.0)] == ["COTIIRT"]
+
+    # BOME's -58,700, held 16.3 minutes.
+    runner._position_age = {"COTIIRT": now - 16.3 * 60}
+    assert [s for s, _ in runner.stale_positions(300.0)] == ["COTIIRT"]
+
+
+def test_a_closed_position_is_not_sold_twice():
+    """The wallet lags the fill, so the next sweep sees a ghost.
+
+    On the first live run three "could not cross out" errors landed seconds
+    after three successful exits, on the same symbols: the market order had
+    cleared the position, but the balance snapshot and the trade history had
+    not caught up, so the cap fired again and the exchange rejected it.
+    """
+    from nbtrend.live.maker import MakerRunner, MarketMaker
+
+    placed = []
+
+    class _REST:
+        def orderbook(self, symbol):
+            return _book(998_000.0, 1_002_000.0)
+
+        def add_order(self, **kw):
+            placed.append(kw)
+            return object()
+
+    spec = _Spec()
+    mm = MarketMaker(None, {"XIRT": spec}, ["XIRT"], maker_fee=0.0008,
+                     min_quote_rial=550_000.0, dry_run=False)
+    mm._balances = {"x": 10.0}
+    runner = MakerRunner(None, mm, _REST())
+    runner._position_age = {"XIRT": time.time() - 3_600.0}
+
+    assert runner.exit_stale_positions(300.0) == 1
+    assert len(placed) == 1
+    # The wallet has not refreshed, but the position must not fire again.
+    assert runner.exit_stale_positions(300.0) == 0, "sold the same position twice"
+    assert len(placed) == 1

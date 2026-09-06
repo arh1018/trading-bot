@@ -161,6 +161,10 @@ class NobitexREST:
             for side in ("bids", "asks")
         }
 
+    def trades_list(self) -> list[dict]:
+        """Our own executed trades, newest first. Bounded history."""
+        return self._get("/market/trades/list").get("trades", []) or []
+
     def market_stats(self, src: str, dst: str = "rls") -> dict:
         """24h stats, RIAL."""
         data = self._get("/market/stats", srcCurrency=src, dstCurrency=dst)

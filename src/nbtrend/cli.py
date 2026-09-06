@@ -265,7 +265,8 @@ def run(
 
 
 async def _socket_loop(cfg, mm, api, symbols, deadline, fallback_s: float,
-                       protected: set[str] | None = None) -> None:
+                       protected: set[str] | None = None,
+                       max_hold_s: float = 0.0) -> None:
     """Quote from websocket book events rather than a polling clock.
 
     The blocking work -- placing and cancelling orders -- runs in a thread, not
@@ -285,6 +286,10 @@ async def _socket_loop(cfg, mm, api, symbols, deadline, fallback_s: float,
     # quote including the asks that sell held inventory.
     runner = SocketMakerRunner(cfg, mm, api, ws, min_requote_gap_s=fallback_s)
     runner.protected = set(protected or ())
+    # The socket runner is a SEPARATE object from the REST one, so anything
+    # set on that one has to be set here too -- `--requote` was wired only to
+    # the fallback path once already, and quoting ran at its 2s default.
+    runner.max_hold_s = max_hold_s
 
     def _handler(symbol: str):
         # Handlers are called as (channel, payload) -- see nobitex_ws.Handler.
@@ -470,6 +475,11 @@ def make(
     min_cash: float = typer.Option(
         0.0, help="Rial to keep unspent across the whole book (portfolio floor)."
     ),
+    max_hold_min: float = typer.Option(
+        0.0,
+        help="Cross the spread to close a position that has not completed a "
+             "round trip within this many minutes. 0 disables it.",
+    ),
     min_quote: float = typer.Option(
         0.0,
         help="Smallest quote the exchange accepts, in rial. 0 reads "
@@ -523,6 +533,7 @@ def make(
             dry_run=not live,
         )
         runner = MakerRunner(cfg, mm, api)
+        runner.max_hold_s = max_hold_min * 60.0
         protected = {p.strip().upper() for p in protect.split(',') if p.strip()}
         runner.protected = protected
 
@@ -545,7 +556,8 @@ def make(
         deadline = time.time() + minutes * 60
         try:
             if socket:
-                asyncio.run(_socket_loop(cfg, mm, api, wanted, deadline, requote, protected))
+                asyncio.run(_socket_loop(cfg, mm, api, wanted, deadline, requote,
+                                         protected, max_hold_min * 60.0))
             else:
                 while time.time() < deadline:
                     runner.sweep(wanted)

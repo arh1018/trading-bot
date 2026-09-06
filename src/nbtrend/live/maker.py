@@ -30,12 +30,37 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from ..core.types import BookTop, Order, Side
 from ..units import round_to_step
 
 log = logging.getLogger(__name__)
+
+
+def _trade_ts(raw: object) -> float:
+    """Unix seconds from a trade timestamp, 0.0 when unparseable."""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, int | float):
+        value = float(raw)
+        return value / 1000.0 if value > 1e11 else value
+    try:
+        return datetime.fromisoformat(str(raw)).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _market_to_symbol(market: str) -> str:
+    """"COTI-RLS" -> "COTIIRT". The history names markets differently."""
+    if not market or "-" not in market:
+        return ""
+    base, _, quote = market.partition("-")
+    if quote.upper() in ("RLS", "IRR", "IRT"):
+        return f"{base.upper()}IRT"
+    return f"{base.upper()}{quote.upper()}"
 
 
 def _is_missing_order(exc: Exception) -> bool:
@@ -698,6 +723,16 @@ class MakerRunner:
         # Global prices move on the world's clock, not our quote loop's.
         self.fair_refresh_s = 60.0
         self._volumes_at = 0.0
+        # symbol -> unix time of the OLDEST buy still unmatched by a sell.
+        # Derived from the exchange's own trade history rather than tracked in
+        # memory, because the keepalive cycles this process and an in-memory
+        # clock would reset the age of every position on every restart --
+        # exactly when a stuck position most needs to be noticed.
+        self._position_age: dict[str, float] = {}
+        # 0 disables the cap. Set from the CLI.
+        self.max_hold_s: float = 0.0
+        self._ages_at = 0.0
+        self.age_refresh_s = 120.0
         # A day's volume barely moves between sweeps, and this costs one REST
         # call per market, so it runs far more slowly than the quote loop.
         self.volume_refresh_s = 900.0
@@ -826,6 +861,87 @@ class MakerRunner:
                 live.append({"clientOrderId": coid})
         return live
 
+    def exit_stale_positions(self, max_hold_s: float) -> int:
+        """Cross the spread to close positions that have not cycled.
+
+        Market making earns the spread by completing ROUND TRIPS. A buy that
+        never finds its sell is not a trade, it is a directional bet nobody
+        chose -- and it keeps paying: 13 markets were quoted over 24 hours and
+        3 completed a round trip, at 18,840 rial of fees per completion.
+
+        The cost of the fix is the taker fee, and it is much the smaller
+        number. COTI bought at 39,780 and sold 8 minutes later at 38,700 after
+        a 2.7 percent drop, realising -80,750. Crossing out at the five
+        minute mark would have paid the taker fee on ~5,000,000 rial -- about
+        5,000 -- instead.
+
+        Only the ask side is crossed. A stale position here is always long
+        (spot cannot be short), so exiting means selling what we hold.
+        """
+        if max_hold_s <= 0:
+            return 0
+
+        exited = 0
+        for symbol, age in self.stale_positions(max_hold_s):
+            if symbol in self.protected:
+                continue
+            spec = self.mm.specs.get(symbol)
+            if spec is None:
+                continue
+            units = self.mm.available_base(symbol)
+            if units <= 0:
+                continue
+            try:
+                book = self.latest_book(symbol) or self.rest.orderbook(symbol)
+            except Exception:
+                log.warning("%s: no book; cannot exit stale position", symbol)
+                continue
+            amount = round_to_step(units, spec.amount_step)
+            if amount <= 0 or amount * book.best_bid < self.mm.min_quote_rial:
+                # Below the exchange minimum: crossing would be rejected, and
+                # the position has to be worked out by the ordinary ask.
+                continue
+
+            # The resting quote has to go first, or the exit competes with it.
+            self.cancel_working(symbol)
+            if self.mm.dry_run:
+                log.info(
+                    "[dry-run] %s would cross out %.8f after %.0fs held",
+                    symbol, amount, age,
+                )
+                exited += 1
+                continue
+            try:
+                from ..core.types import OrderType
+                from ..execution.base import new_client_order_id
+
+                self.rest.add_order(
+                    src=spec.src, dst=spec.dst, side=Side.SELL,
+                    amount=amount, price=None,
+                    execution=OrderType.MARKET,
+                    client_order_id=new_client_order_id("exit"),
+                )
+                self.mm.note_placement(1)
+                self._orders_at = 0.0
+                self._ages_at = 0.0          # the position is gone; re-read
+                # The wallet snapshot still shows units we no longer hold, and
+                # the trade history has not caught up either, so the next sweep
+                # sees the same "stale position" and tries to sell it again --
+                # 3 rejections against 5 real exits on the first live run.
+                # Forget the age NOW; the refresh will restore it if the market
+                # order did not in fact clear the position.
+                self._position_age.pop(symbol, None)
+                self._balances_at = 0.0
+                exited += 1
+                log.warning(
+                    "%s: crossed out %.8f after %.0fs held (cap %.0fs) -- "
+                    "taking the taker fee rather than the drift",
+                    symbol, amount, age, max_hold_s,
+                )
+            except Exception:
+                log.exception("%s: could not cross out stale position", symbol)
+        return exited
+
     def cancel_working(self, symbol: str, live: list[dict] | None = None) -> int:
         """Pull our quotes before posting new ones.
 
@@ -903,6 +1019,72 @@ class MakerRunner:
             if units * mid >= min_rial:
                 out.append(symbol)
         return out
+
+    def refresh_position_ages(self) -> int:
+        """How long each open position has been held, from the trade history.
+
+        FIFO-matches sells against buys per market; whatever buy volume is
+        left unmatched is the open position, and the timestamp of its OLDEST
+        remaining buy is what the hold-time cap measures against.
+
+        Read from the exchange rather than tracked in memory on purpose: the
+        supervisor restarts this process, and an in-memory clock would reset
+        every position's age to zero exactly when a stuck one most needs to be
+        found. Failures leave the previous ages in place rather than clearing
+        them, since "no data" must not read as "nothing is old".
+        """
+        now = time.time()
+        if now - self._ages_at < self.age_refresh_s:
+            return 0
+        self._ages_at = now
+
+        try:
+            trades = self.rest.trades_list()
+        except Exception:
+            log.debug("could not read trade history for position ages", exc_info=True)
+            return 0
+
+        legs: dict[str, list[tuple[float, float]]] = defaultdict(list)
+        for t in sorted(trades, key=lambda x: _trade_ts(x.get("timestamp"))):
+            market = str(t.get("market") or "")
+            symbol = _market_to_symbol(market)
+            if not symbol:
+                continue
+            try:
+                amount = float(t.get("amount") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if amount <= 0:
+                continue
+            if t.get("type") == "buy":
+                legs[symbol].append((_trade_ts(t.get("timestamp")), amount))
+                continue
+            left = amount
+            while left > 1e-12 and legs[symbol]:
+                ts, amt = legs[symbol][0]
+                take = min(left, amt)
+                left -= take
+                if take >= amt - 1e-12:
+                    legs[symbol].pop(0)
+                else:
+                    legs[symbol][0] = (ts, amt - take)
+
+        self._position_age = {
+            sym: rows[0][0] for sym, rows in legs.items() if rows
+        }
+        return len(self._position_age)
+
+    def stale_positions(self, max_hold_s: float) -> list[tuple[str, float]]:
+        """Open positions older than `max_hold_s`, oldest first."""
+        if max_hold_s <= 0:
+            return []
+        now = time.time()
+        out = [
+            (sym, now - opened)
+            for sym, opened in self._position_age.items()
+            if opened > 0 and now - opened >= max_hold_s
+        ]
+        return sorted(out, key=lambda r: -r[1])
 
     def refresh_volumes(self, specs: dict) -> int:
         """Update each market's 24h rial volume, which sets its quote size.
@@ -1023,6 +1205,10 @@ class MakerRunner:
         self.refresh_fair_values(self.mm.specs)
         # And each market's quote size, on a slower one still.
         self.refresh_volumes(self.mm.specs)
+        # Positions that never cycled: age them, then close the ones past the
+        # cap BEFORE quoting, so a stale position is not requoted around.
+        self.refresh_position_ages()
+        self.exit_stale_positions(self.max_hold_s)
 
         # Quote the configured markets PLUS anything we hold. A held position
         # with no ask is a directional bet nobody chose, and it persists until
